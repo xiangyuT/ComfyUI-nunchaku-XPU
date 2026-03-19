@@ -9,12 +9,45 @@ import comfy.utils
 import torch
 from comfy import model_detection, model_management
 
-from nunchaku.models.transformers.utils import convert_fp16, patch_scale_key
-from nunchaku.utils import check_hardware_compatibility, get_precision_from_quantization_config, is_turing
+from nunchaku_torch.models.transformers.utils import convert_fp16, decode_int4_state_dict_for_cpu, patch_scale_key
+from nunchaku_torch.utils import get_precision_from_quantization_config
 
 from ...model_configs.zimage import NunchakuZImage
 from ...model_patcher.zimage import ZImageModelPatcher
 from ..utils import get_filename_list, get_full_path_or_raise
+
+
+def _is_xpu_device(device: torch.device) -> bool:
+    """Check if the device is an XPU device."""
+    return device.type == "xpu"
+
+
+def _check_hardware_compatibility_safe(quantization_config: dict, device: torch.device):
+    """
+    XPU-safe hardware compatibility check.
+
+    On XPU: skip CUDA SM capability checks (XPU always uses int4).
+    On CUDA: delegate to the original check_hardware_compatibility.
+    """
+    if _is_xpu_device(device):
+        # XPU always uses int4, no SM capability check needed
+        return
+    # CUDA path: use original check
+    from nunchaku_torch.utils import check_hardware_compatibility
+    check_hardware_compatibility(quantization_config, device)
+
+
+def _is_turing_safe(device: torch.device) -> bool:
+    """
+    XPU-safe Turing check.
+
+    On XPU: always returns False (Turing is CUDA SM75 only).
+    On CUDA: delegate to the original is_turing.
+    """
+    if _is_xpu_device(device):
+        return False
+    from nunchaku_torch.utils import is_turing
+    return is_turing(device)
 
 
 def _patch_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -127,13 +160,17 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
 
     load_device = model_management.get_torch_device()
     offload_device = model_management.unet_offload_device()
-    check_hardware_compatibility(quantization_config, load_device)
+    _check_hardware_compatibility_safe(quantization_config, load_device)
 
     new_sd = sd
 
+    # On XPU/CPU: decode CUDA-tiled INT4 layout to row-major format
+    if _is_xpu_device(load_device) or load_device.type == "cpu":
+        decode_int4_state_dict_for_cpu(new_sd)
+
     model_config = NunchakuZImage(rank=rank, precision=precision, skip_refiners=skip_refiners)
 
-    if not is_turing():
+    if not _is_turing_safe(load_device):
         unet_dtype = torch.bfloat16
         manual_cast_dtype = None
         torch_dtype = torch.bfloat16

@@ -65,6 +65,21 @@ def get_package_version(package_name: str) -> str:
         return f"Package '{package_name}' not found."
 
 
+def get_nunchaku_package_version() -> str:
+    """
+    Retrieve the nunchaku package version, trying 'nunchaku' first then 'nunchaku-torch' as fallback.
+
+    Returns
+    -------
+    str
+        The version string of the nunchaku or nunchaku-torch package.
+    """
+    version = get_package_version("nunchaku")
+    if "not found" in version.lower():
+        version = get_package_version("nunchaku-torch")
+    return version
+
+
 def get_plugin_version() -> str:
     """
     Retrieve the version of the current plugin from pyproject.toml.

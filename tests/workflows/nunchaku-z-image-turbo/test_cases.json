@@ -20,5 +20,14 @@
       "58,inputs,model_name": "svdq-{precision}_r128-z-image-turbo.safetensors",
       "44,inputs,seed": 88888
     }
+  },
+  {
+    "description": "XPU SVDQuant INT4 (nunchaku_torch backend)",
+    "device": "xpu",
+    "api_json": "api_xpu.json",
+    "inputs": {
+      "58,inputs,model_name": "svdq-int4_r256-z-image-turbo.safetensors",
+      "44,inputs,seed": 88888
+    }
   }
 ]

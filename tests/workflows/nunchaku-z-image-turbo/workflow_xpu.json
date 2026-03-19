@@ -1,0 +1,600 @@
+{
+    "id": "xpu-z-image-turbo-workflow",
+    "revision": 0,
+    "last_node_id": 58,
+    "last_link_id": 63,
+    "nodes": [
+        {
+            "id": 39,
+            "type": "CLIPLoader",
+            "pos": [
+                130,
+                435
+            ],
+            "size": [
+                270,
+                106
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "clip_name",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "clip_name"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "type",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "type"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "device",
+                    "shape": 7,
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "device"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "CLIP",
+                    "type": "CLIP",
+                    "links": [
+                        44
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "CLIPLoader",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.73",
+                "models": [
+                    {
+                        "name": "qwen_3_4b.safetensors",
+                        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors",
+                        "directory": "text_encoders"
+                    }
+                ]
+            },
+            "widgets_values": [
+                "qwen_3_4b.safetensors",
+                "lumina2",
+                "default"
+            ]
+        },
+        {
+            "id": 40,
+            "type": "VAELoader",
+            "pos": [
+                130,
+                585
+            ],
+            "size": [
+                270,
+                58
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "vae_name",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "vae_name"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "VAE",
+                    "type": "VAE",
+                    "links": [
+                        39
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VAELoader",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.73",
+                "models": [
+                    {
+                        "name": "ae.safetensors",
+                        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+                        "directory": "vae"
+                    }
+                ]
+            },
+            "widgets_values": [
+                "ae.safetensors"
+            ]
+        },
+        {
+            "id": 42,
+            "type": "ConditioningZeroOut",
+            "pos": [
+                660,
+                725
+            ],
+            "size": [
+                198,
+                26
+            ],
+            "flags": {},
+            "order": 6,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "conditioning",
+                    "type": "CONDITIONING",
+                    "link": 36
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "CONDITIONING",
+                    "type": "CONDITIONING",
+                    "links": [
+                        42
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "ConditioningZeroOut",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.73"
+            },
+            "widgets_values": []
+        },
+        {
+            "id": 41,
+            "type": "EmptySD3LatentImage",
+            "pos": [
+                130,
+                735
+            ],
+            "size": [
+                260,
+                110
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "width",
+                    "type": "INT",
+                    "widget": {
+                        "name": "width"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "height",
+                    "type": "INT",
+                    "widget": {
+                        "name": "height"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "batch_size",
+                    "type": "INT",
+                    "widget": {
+                        "name": "batch_size"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "LATENT",
+                    "type": "LATENT",
+                    "slot_index": 0,
+                    "links": [
+                        43
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "EmptySD3LatentImage",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.64"
+            },
+            "widgets_values": [
+                1024,
+                1024,
+                1
+            ]
+        },
+        {
+            "id": 9,
+            "type": "SaveImage",
+            "pos": [
+                1240,
+                260
+            ],
+            "size": [
+                780,
+                660
+            ],
+            "flags": {},
+            "order": 9,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": 45
+                },
+                {
+                    "name": "filename_prefix",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "filename_prefix"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [],
+            "properties": {
+                "Node name for S&R": "SaveImage",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.64"
+            },
+            "widgets_values": [
+                "z-image-xpu"
+            ]
+        },
+        {
+            "id": 47,
+            "type": "ModelSamplingAuraFlow",
+            "pos": [
+                900,
+                265
+            ],
+            "size": [
+                310,
+                60
+            ],
+            "flags": {},
+            "order": 5,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "model",
+                    "type": "MODEL",
+                    "link": 63
+                },
+                {
+                    "name": "shift",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "shift"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "MODEL",
+                    "type": "MODEL",
+                    "slot_index": 0,
+                    "links": [
+                        40
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "ModelSamplingAuraFlow",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.64"
+            },
+            "widgets_values": [
+                3
+            ]
+        },
+        {
+            "id": 43,
+            "type": "VAEDecode",
+            "pos": [
+                1240,
+                170
+            ],
+            "size": [
+                210,
+                46
+            ],
+            "flags": {},
+            "order": 8,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "samples",
+                    "type": "LATENT",
+                    "link": 38
+                },
+                {
+                    "name": "vae",
+                    "type": "VAE",
+                    "link": 39
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "IMAGE",
+                    "type": "IMAGE",
+                    "slot_index": 0,
+                    "links": [
+                        45
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VAEDecode",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.64"
+            },
+            "widgets_values": []
+        },
+        {
+            "id": 45,
+            "type": "CLIPTextEncode",
+            "pos": [
+                450,
+                305
+            ],
+            "size": [
+                410,
+                370
+            ],
+            "flags": {},
+            "order": 4,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "clip",
+                    "type": "CLIP",
+                    "link": 44
+                },
+                {
+                    "name": "text",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "text"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "CONDITIONING",
+                    "type": "CONDITIONING",
+                    "links": [
+                        36,
+                        41
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "CLIPTextEncode",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.73"
+            },
+            "widgets_values": [
+                "Latina female with thick wavy hair, harbor boats and pastel houses behind. Breezy seaside light, warm tones, cinematic close-up."
+            ],
+            "color": "#232",
+            "bgcolor": "#353"
+        },
+        {
+            "id": 58,
+            "type": "NunchakuZImageDiTLoader",
+            "pos": [
+                86,
+                318
+            ],
+            "size": [
+                303,
+                58
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "model_name",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "model_name"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "MODEL",
+                    "type": "MODEL",
+                    "links": [
+                        63
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "NunchakuZImageDiTLoader"
+            },
+            "widgets_values": [
+                "svdq-int4_r256-z-image-turbo.safetensors"
+            ]
+        },
+        {
+            "id": 44,
+            "type": "KSampler",
+            "pos": [
+                900,
+                375
+            ],
+            "size": [
+                315,
+                474
+            ],
+            "flags": {},
+            "order": 7,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "model",
+                    "type": "MODEL",
+                    "link": 40
+                },
+                {
+                    "name": "positive",
+                    "type": "CONDITIONING",
+                    "link": 41
+                },
+                {
+                    "name": "negative",
+                    "type": "CONDITIONING",
+                    "link": 42
+                },
+                {
+                    "name": "latent_image",
+                    "type": "LATENT",
+                    "link": 43
+                },
+                {
+                    "name": "seed",
+                    "type": "INT",
+                    "widget": {
+                        "name": "seed"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "steps",
+                    "type": "INT",
+                    "widget": {
+                        "name": "steps"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "cfg",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "cfg"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "sampler_name",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "sampler_name"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "scheduler",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "scheduler"
+                    },
+                    "link": null
+                },
+                {
+                    "name": "denoise",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "denoise"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "LATENT",
+                    "type": "LATENT",
+                    "slot_index": 0,
+                    "links": [
+                        38
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "KSampler",
+                "cnr_id": "comfy-core",
+                "ver": "0.3.64"
+            },
+            "widgets_values": [
+                88888,
+                "fixed",
+                9,
+                1,
+                "res_multistep",
+                "simple",
+                1
+            ]
+        }
+    ],
+    "links": [
+        [36, 45, 0, 42, 0, "CONDITIONING"],
+        [38, 44, 0, 43, 0, "LATENT"],
+        [39, 40, 0, 43, 1, "VAE"],
+        [40, 47, 0, 44, 0, "MODEL"],
+        [41, 45, 0, 44, 1, "CONDITIONING"],
+        [42, 42, 0, 44, 2, "CONDITIONING"],
+        [43, 41, 0, 44, 3, "LATENT"],
+        [44, 39, 0, 45, 0, "CLIP"],
+        [45, 43, 0, 9, 0, "IMAGE"],
+        [63, 58, 0, 47, 0, "MODEL"]
+    ],
+    "groups": [
+        {
+            "id": 2,
+            "title": "Step2 - Image size",
+            "bounding": [120, 670, 290, 200],
+            "color": "#3f789e",
+            "font_size": 24,
+            "flags": {}
+        },
+        {
+            "id": 3,
+            "title": "Step3 - Prompt",
+            "bounding": [430, 240, 450, 540],
+            "color": "#3f789e",
+            "font_size": 24,
+            "flags": {}
+        },
+        {
+            "id": 4,
+            "title": "Step1 - Load models (XPU SVDQuant INT4)",
+            "bounding": [120, 240, 290, 414],
+            "color": "#3f789e",
+            "font_size": 24,
+            "flags": {}
+        }
+    ],
+    "config": {},
+    "extra": {
+        "ds": {
+            "scale": 0.92,
+            "offset": [543, 176]
+        },
+        "frontendVersion": "1.34.6",
+        "workflowRendererVersion": "LG"
+    },
+    "version": 0.4
+}

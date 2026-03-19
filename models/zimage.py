@@ -10,7 +10,7 @@ The injected transformer model is `comfy.ldm.lumina.model.NextDiT` in ComfyUI re
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -18,10 +18,41 @@ import torch.nn.functional as F
 from comfy.ldm.lumina.model import FeedForward, JointAttention, JointTransformerBlock, NextDiT, clamp_fp16
 from comfy.ldm.modules.attention import optimized_attention_masked
 
-from nunchaku.models.embeddings import pack_rotemb
-from nunchaku.models.linear import SVDQW4A4Linear
-from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
-from nunchaku.utils import pad_tensor
+from nunchaku_torch.models.embeddings import pack_rotemb
+from nunchaku_torch.models.linear import SVDQW4A4Linear
+from nunchaku_torch.utils import pad_tensor
+
+# Conditionally import XPU-specific ops
+_xpu_available = False
+try:
+    from nunchaku_torch.ops.xpu_ops import svdq_gemm_w4a4_xpu_bf16act, is_available as xpu_ops_available
+    _xpu_available = xpu_ops_available()
+except ImportError:
+    pass
+
+# Conditionally import ESIMD kernels for XPU norm/rotary
+_esimd_norm = None
+_esimd_rotary = None
+try:
+    from omni_xpu_kernel.norm import ESIMDRMSNorm
+    from omni_xpu_kernel.rotary import ESIMDRotaryEmb
+    _esimd_norm = ESIMDRMSNorm()
+    _esimd_rotary = ESIMDRotaryEmb()
+except ImportError:
+    pass
+
+# Import CUDA-specific ops only if available
+_cuda_gemm_available = False
+try:
+    from nunchaku_torch.ops.gemm import svdq_gemm_w4a4_cuda
+    _cuda_gemm_available = True
+except ImportError:
+    pass
+
+
+def _is_xpu_device(device: torch.device) -> bool:
+    """Check if the device is an XPU device."""
+    return device.type == "xpu"
 
 
 def add_comfy_cast_weights_attr(svdq_linear: SVDQW4A4Linear, comfy_linear: nn.Linear):
@@ -82,12 +113,23 @@ def fused_qkv_norm_rotary(
     """
     Fused quantized QKV projection with RMSNorm and rotary embeddings.
 
+    On CUDA: uses fused CUDA kernel (svdq_gemm_w4a4_cuda with norm_q, norm_k, rotary_emb args).
+    On XPU: uses bf16act GEMM + separate ESIMD RMSNorm + ESIMD Rotary kernels.
+
     Adapted from nunchaku.ops.fused#fused_qkv_norm_rottary.
 
     Manual cast `q_norm` weight and `k_norm` weight from `torch.bfloat16` to `torch.float16` when `x` dtype is `torch.float16`.
     """
     batch_size, seq_len, channels = x.shape
     x_dtype = x.dtype
+    device_type = x.device.type
+
+    if device_type == "xpu" and _xpu_available:
+        # --- XPU path: bf16act GEMM + separate ESIMD norm/rotary ---
+        return _xpu_fused_qkv_norm_rotary(x, qkv, q_norm_weight, k_norm_weight, freqs_cis)
+
+    # --- CUDA path: fused kernel ---
+    assert _cuda_gemm_available, "CUDA GEMM kernel not available"
     x = x.view(batch_size * seq_len, channels)
     quantized_x, ascales, lora_act = qkv.quantize(x)
     output = torch.empty(batch_size * seq_len, qkv.out_features, dtype=x.dtype, device=x.device)
@@ -115,6 +157,115 @@ def fused_qkv_norm_rotary(
     )
     output = output.view(batch_size, seq_len, -1)
     return output
+
+
+def _xpu_fused_qkv_norm_rotary(
+    x: torch.Tensor,
+    qkv: SVDQW4A4Linear,
+    q_norm_weight: nn.Parameter,
+    k_norm_weight: nn.Parameter,
+    freqs_cis: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    XPU path for QKV projection + RMSNorm + Rotary.
+
+    Uses bf16act GEMM (oneDNN INT4) + separate ESIMD RMSNorm + ESIMD Rotary kernels.
+    Adapted from NunchakuZImageFusedModule.forward() in nunchaku_torch.
+    """
+    batch_size, seq_len, channels = x.shape
+    x_2d = x.view(batch_size * seq_len, channels)
+
+    output = torch.empty(batch_size * seq_len, qkv.out_features, dtype=x.dtype, device=x.device)
+
+    # Prepare oneDNN weights (lazy cache)
+    if not hasattr(qkv, '_wgt_u4'):
+        try:
+            from omni_xpu_kernel.svdq import prepare_onednn_weights
+            u4, sf16 = prepare_onednn_weights(qkv.qweight.view(torch.uint8), qkv.wscales)
+            qkv._wgt_u4 = u4
+            qkv._wscales_f16 = sf16
+            # Free original weight storage
+            qkv.qweight.data = torch.empty(0, dtype=torch.int8, device=x.device)
+            qkv.wscales.data = torch.empty(0, dtype=qkv.wscales.dtype, device=x.device)
+        except (ImportError, AttributeError):
+            qkv._wgt_u4 = None
+            qkv._wscales_f16 = None
+
+    # Step 1: LoRA down-proj + smooth + bf16act GEMM
+    lora_act_out = x_2d @ qkv.proj_down
+    act_smoothed = x_2d / qkv.smooth_factor
+    svdq_gemm_w4a4_xpu_bf16act(
+        act_bf16=act_smoothed,
+        wgt=qkv.qweight,
+        wscales=qkv.wscales,
+        out=output,
+        lora_act_in=lora_act_out,
+        lora_up=qkv.proj_up,
+        bias=qkv.bias,
+        alpha=1.0 if qkv.precision == "nvfp4" else None,
+        wcscales=qkv.wcscales if qkv.precision == "nvfp4" else None,
+        wgt_u4=getattr(qkv, '_wgt_u4', None),
+        wscales_f16=getattr(qkv, '_wscales_f16', None),
+    )
+
+    output = output.view(batch_size, seq_len, -1)
+
+    # Step 2: Split QKV
+    query, key, value = output.chunk(3, dim=-1)
+    head_dim = int(q_norm_weight.numel())
+    heads = query.shape[-1] // head_dim
+
+    query = query.view(batch_size, seq_len, heads, head_dim)
+    key = key.view(batch_size, seq_len, heads, head_dim)
+
+    # Step 3: ESIMD RMSNorm
+    if _esimd_norm is not None:
+        flat_q = query.reshape(-1, head_dim).contiguous()
+        flat_k = key.reshape(-1, head_dim).contiguous()
+        query = _esimd_norm.rms_norm(q_norm_weight, flat_q, 1e-6).reshape(batch_size, seq_len, heads, head_dim)
+        key = _esimd_norm.rms_norm(k_norm_weight, flat_k, 1e-6).reshape(batch_size, seq_len, heads, head_dim)
+    else:
+        # Fallback: PyTorch RMSNorm
+        def _apply_rmsnorm(x_in, weight, eps=1e-6):
+            variance = x_in.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+            out = x_in * torch.rsqrt(variance + eps)
+            return (out.to(weight.dtype) * weight).to(x_in.dtype)
+        query = _apply_rmsnorm(query, q_norm_weight)
+        key = _apply_rmsnorm(key, k_norm_weight)
+
+    # Step 4: ESIMD Rotary
+    if freqs_cis is not None:
+        if _esimd_rotary is not None:
+            # freqs_cis is [B, S, HD/2] complex64; extract cos/sin as [S, HD/2] f32
+            cos_cache = freqs_cis[0].real.contiguous()
+            sin_cache = freqs_cis[0].imag.contiguous()
+            flat_q = query.reshape(-1, head_dim).contiguous()
+            flat_k = key.reshape(-1, head_dim).contiguous()
+            query = _esimd_rotary.rotary_emb(flat_q, cos_cache, sin_cache, seq_len, heads).reshape(
+                batch_size, seq_len, heads, head_dim
+            )
+            key = _esimd_rotary.rotary_emb(flat_k, cos_cache, sin_cache, seq_len, heads).reshape(
+                batch_size, seq_len, heads, head_dim
+            )
+        else:
+            # Fallback: PyTorch rotary
+            def _apply_rotary_emb(x_in, fc):
+                device_t = x_in.device.type if x_in.device.type != "meta" else "cpu"
+                with torch.amp.autocast(device_t, enabled=False):
+                    xc = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
+                    x_out = torch.view_as_real(xc * fc.unsqueeze(2)).flatten(3)
+                    return x_out.type_as(x_in)
+            query = _apply_rotary_emb(query, freqs_cis)
+            key = _apply_rotary_emb(key, freqs_cis)
+
+    # Recombine for return — on XPU we return the full (Q, K, V) concatenated like CUDA path
+    value = value.view(batch_size, seq_len, heads, head_dim)
+    # Return concatenated [Q, K, V] along last dim, then reshaped to [B, S, 3*heads*head_dim]
+    return torch.cat([
+        query.view(batch_size, seq_len, -1),
+        key.view(batch_size, seq_len, -1),
+        value.view(batch_size, seq_len, -1),
+    ], dim=-1)
 
 
 class ComfyNunchakuZImageAttention(JointAttention):
@@ -148,7 +299,8 @@ class ComfyNunchakuZImageAttention(JointAttention):
         """
         Adapted from comfy.ldm.lumina.model.JointAttention#forward
 
-        Optimized with fusing qkv projection, q_norm, k_norm and RoPE in one kernel.
+        Optimized with fusing qkv projection, q_norm, k_norm and RoPE in one kernel (CUDA)
+        or separate ESIMD kernels (XPU).
         """
         logging.debug(f"x shape: {x.shape}, freqs_cis shape: {freqs_cis.shape}")
         bsz, seqlen, _ = x.shape
@@ -213,7 +365,10 @@ class ComfyNunchakuZImageFeedForward(nn.Module):
 class RopeFuseAttentionHook:
     """
     This class acts as a pre-forward hook on `ComfyNunchakuZImageAttention`,
-    replace the `freqs_cis` tensor with packed one to align with the input format of `fused_qkv_norm_rottary` method.
+    replace the `freqs_cis` tensor with packed one to align with the input format of the fused kernel.
+
+    On CUDA: packs freqs_cis via pack_rotemb for the fused CUDA kernel.
+    On XPU: converts freqs_cis to complex64 format for the ESIMD rotary kernel.
     """
 
     def __init__(self):
@@ -223,28 +378,43 @@ class RopeFuseAttentionHook:
     def pre_forward(self, module: ComfyNunchakuZImageAttention, input_args: tuple, input_kwargs: dict):
         """
         Pre-forward hook method.
-        Create a `packed_freqs_cis` tensor that is aligned with the input format of `fused_qkv_norm_rottary` method
-        from the original `freqs_cis` and cache it in the  `packed_freqs_cis_cache` dict.
+        Transform freqs_cis to the format expected by the device-specific kernel.
         """
         new_input_args = list(input_args)
         freqs_cis: torch.Tensor = new_input_args[2]
         if freqs_cis is None:
             return None
-        cache_key = (freqs_cis.data_ptr(), freqs_cis.shape)
-        orig_shape = freqs_cis.shape
+        cache_key = (freqs_cis.data_ptr(), freqs_cis.shape, module.qkv.qweight.device.type)
         packed_freqs_cis = self.packed_freqs_cis_cache.get(cache_key, None)
         if packed_freqs_cis is None:
-            # freqs_cis shape example: torch.Size([1, 4160, 1, 64, 2, 2])
-            # freqs_cis dtype: torch.float32
-            freqs_cis = freqs_cis[..., [1], :].squeeze(2)  # See comfy.ldm.flux.math#rope, #apply_rope
-            packed_freqs_cis = pack_rotemb(pad_tensor(freqs_cis, 256, 1))
+            orig_shape = freqs_cis.shape
+            device_type = module.qkv.qweight.device.type
+
+            if device_type == "xpu":
+                # XPU path: convert to complex64 for ESIMD rotary kernel
+                # freqs_cis shape: [1, seq_len, 1, 64, 2, 2] float32
+                # The rotation matrix has shape [..., 2, 2] = [[cos, -sin], [sin, cos]]
+                # We select row 1 ([sin, cos]) and form complex: cos + j*sin
+                # Using [..., 1, :] (without brackets) to avoid keeping dim
+                fc = freqs_cis[..., 1, :].squeeze(2)
+                # fc shape: [1, seq_len, 64, 2] — last dim is [sin, cos]
+                # Swap to [cos, sin] order for view_as_complex (real=cos, imag=sin)
+                fc = fc.flip(-1)
+                packed_freqs_cis = torch.view_as_complex(fc.contiguous())
+                # Shape: [1, seq_len, 64] complex64
+            else:
+                # CUDA path: pack for fused kernel
+                fc = freqs_cis[..., [1], :].squeeze(2)  # See comfy.ldm.flux.math#rope, #apply_rope
+                packed_freqs_cis = pack_rotemb(pad_tensor(fc, 256, 1))
+
             self.packed_freqs_cis_cache[cache_key] = packed_freqs_cis
             logging.debug(
-                f"cache miss and created, cache_key: {cache_key}, orig shape: {orig_shape}, packed shape: {packed_freqs_cis.shape}"
+                f"cache miss and created, cache_key: {cache_key}, orig shape: {orig_shape}, "
+                f"packed shape: {packed_freqs_cis.shape}, device_type: {device_type}"
             )
         else:
             logging.debug(
-                f"cache hit, cache_key: {cache_key}, orig shape: {orig_shape}, packed shape: {packed_freqs_cis.shape}"
+                f"cache hit, cache_key: {cache_key}, packed shape: {packed_freqs_cis.shape}"
             )
         new_input_args[2] = packed_freqs_cis
         return tuple(new_input_args), input_kwargs

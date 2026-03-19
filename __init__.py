@@ -6,6 +6,9 @@ import torch
 import yaml
 from packaging.version import InvalidVersion, Version
 
+# Detect whether we're running on XPU (no CUDA available)
+_IS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available() and not torch.cuda.is_available()
+
 # vanilla and LTS compatibility snippet
 try:
     from comfy_compatibility.vanilla import prepare_vanilla_environment
@@ -15,9 +18,12 @@ try:
     from comfy.model_downloader import add_known_models
     from comfy.model_downloader_types import HuggingFile
 
-    capability = torch.cuda.get_device_capability(0 if torch.cuda.is_available() else None)
-    sm = f"{capability[0]}{capability[1]}"
-    precision = "fp4" if sm == "120" else "int4"
+    if _IS_XPU:
+        precision = "int4"  # XPU always uses int4
+    else:
+        capability = torch.cuda.get_device_capability(0 if torch.cuda.is_available() else None)
+        sm = f"{capability[0]}{capability[1]}"
+        precision = "fp4" if sm == "120" else "int4"
 
     # add known models
 
@@ -52,15 +58,16 @@ logger = logging.getLogger(__name__)
 
 logger.info("=" * 40 + " ComfyUI-nunchaku Initialization " + "=" * 40)
 
-from .utils import get_package_version, get_plugin_version
+from .utils import get_nunchaku_package_version, get_plugin_version
 
-nunchaku_full_version = get_package_version("nunchaku").split("+")[0].strip()
+nunchaku_full_version = get_nunchaku_package_version().split("+")[0].strip()
 
 logger.info(f"Nunchaku version: {nunchaku_full_version}")
 logger.info(f"ComfyUI-nunchaku version: {get_plugin_version()}")
+logger.info(f"XPU mode: {_IS_XPU}")
 
 
-min_nunchaku_version = "1.0.0"
+min_nunchaku_version = "0.1.0" if _IS_XPU else "1.0.0"
 nunchaku_version = nunchaku_full_version.split("+")[0].strip()
 nunchaku_major_minor_patch_version = ".".join(nunchaku_version.split(".")[:3])
 
