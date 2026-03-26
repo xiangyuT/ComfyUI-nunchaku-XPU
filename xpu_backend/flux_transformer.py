@@ -4,6 +4,14 @@ Pure-Python FLUX Transformer for Intel XPU.
 Implements the FLUX diffusion transformer architecture using XPU-compatible
 quantized linear layers. This replaces nunchaku's C++ QuantizedFluxModel.
 
+The module attribute names match the nunchaku safetensors weight keys exactly
+so that ``load_state_dict`` works without key remapping.
+
+Weight files expected:
+    unquantized_layers.safetensors   -- embedders, norms, proj_out
+    transformer_blocks.safetensors   -- double blocks (transformer_blocks.{i}.*)
+                                        and single blocks (single_transformer_blocks.{i}.*)
+
 Architecture reference:
 - https://github.com/black-forest-labs/flux
 - diffusers FluxTransformer2DModel
@@ -30,11 +38,17 @@ class FluxOutput:
     sample: torch.Tensor
 
 
-# --- Embedding Layers ---
+# ---------------------------------------------------------------------------
+# Embedding Layers
+# ---------------------------------------------------------------------------
 
 
 class TimestepEmbedding(nn.Module):
-    """MLP to embed timesteps."""
+    """MLP to embed timesteps.
+
+    Weight keys: ``timestep_embedder.linear_1.*``, ``timestep_embedder.linear_2.*``
+    (or ``text_embedder.linear_1.*``, etc.)
+    """
 
     def __init__(self, in_channels, time_embed_dim, dtype=None, device=None):
         super().__init__()
@@ -65,13 +79,38 @@ class Timesteps(nn.Module):
         return emb
 
 
+class CombinedTimestepTextProjEmbeddings(nn.Module):
+    """Combined timestep + text projection embeddings.
+
+    Weight keys under ``time_text_embed``:
+        time_text_embed.timestep_embedder.linear_1.weight/bias
+        time_text_embed.timestep_embedder.linear_2.weight/bias
+        time_text_embed.text_embedder.linear_1.weight/bias
+        time_text_embed.text_embedder.linear_2.weight/bias
+    """
+
+    def __init__(self, embedding_dim, pooled_projection_dim, dtype=None, device=None):
+        super().__init__()
+        self.time_proj = Timesteps(256)
+        self.timestep_embedder = TimestepEmbedding(256, embedding_dim, dtype=dtype, device=device)
+        self.text_embedder = TimestepEmbedding(pooled_projection_dim, embedding_dim, dtype=dtype, device=device)
+
+    def forward(self, timestep, pooled_projection):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
+        pooled_projections = self.text_embedder(pooled_projection)
+        return timesteps_emb + pooled_projections
+
+
 class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
+    """Same as above but with an additional guidance embedder."""
+
     def __init__(self, embedding_dim, pooled_projection_dim, dtype=None, device=None):
         super().__init__()
         self.time_proj = Timesteps(256)
         self.timestep_embedder = TimestepEmbedding(256, embedding_dim, dtype=dtype, device=device)
         self.guidance_embedder = TimestepEmbedding(256, embedding_dim, dtype=dtype, device=device)
-        self.text_embedder = nn.Linear(pooled_projection_dim, embedding_dim, dtype=dtype, device=device)
+        self.text_embedder = TimestepEmbedding(pooled_projection_dim, embedding_dim, dtype=dtype, device=device)
 
     def forward(self, timestep, guidance, pooled_projection):
         timesteps_proj = self.time_proj(timestep)
@@ -82,27 +121,15 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
         return timesteps_emb + guidance_emb + pooled_projections
 
 
-class CombinedTimestepTextProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim, pooled_projection_dim, dtype=None, device=None):
-        super().__init__()
-        self.time_proj = Timesteps(256)
-        self.timestep_embedder = TimestepEmbedding(256, embedding_dim, dtype=dtype, device=device)
-        self.text_embedder = nn.Linear(pooled_projection_dim, embedding_dim, dtype=dtype, device=device)
-
-    def forward(self, timestep, pooled_projection):
-        timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))
-        pooled_projections = self.text_embedder(pooled_projection)
-        return timesteps_emb + pooled_projections
-
-
-# --- RoPE ---
+# ---------------------------------------------------------------------------
+# RoPE
+# ---------------------------------------------------------------------------
 
 
 def rope(pos, dim, theta):
     """Compute rotary position embeddings."""
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta**scale)
+    omega = 1.0 / (theta ** scale)
     out = torch.einsum("...n,d->...nd", pos.float(), omega)
     out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
     out = out.reshape(*out.shape[:-1], 2, 2)
@@ -113,13 +140,10 @@ def apply_rope(xq, freqs_cis):
     """Apply rotary embeddings to queries/keys.
 
     Args:
-        xq: [B, L, num_heads, head_dim] or [B, L, D] (will be reshaped per-head)
+        xq: [B, L, num_heads, head_dim]
         freqs_cis: [B, 1, L, head_dim/2, 2, 2] from EmbedND
     """
-    # xq: [B, L, n_heads, head_dim]
-    orig_shape = xq.shape
     if xq.ndim == 3:
-        # Already flattened - can't apply per-head, just return
         return xq
 
     B, L, H, D = xq.shape
@@ -129,8 +153,7 @@ def apply_rope(xq, freqs_cis):
     freqs = freqs_cis.unsqueeze(3)  # [B, 1, L, 1, D//2, 2, 2]
     # Apply rotation: out = R @ x for each 2-element pair
     xq_out = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
-    # xq_out: [B, L, H, D//2, 2]
-    return xq_out.reshape(orig_shape).to(xq.dtype)
+    return xq_out.reshape(B, L, H, D).to(xq.dtype)
 
 
 class EmbedND(nn.Module):
@@ -149,7 +172,9 @@ class EmbedND(nn.Module):
         return emb.unsqueeze(1)
 
 
-# --- Attention ---
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
 
 
 class FluxAttention(nn.Module):
@@ -169,78 +194,156 @@ class FluxAttention(nn.Module):
         return out.transpose(1, 2).reshape(B, L, D)
 
 
-# --- Modulation ---
+# ---------------------------------------------------------------------------
+# Modulation (uses AWQ quantized linear)
+# ---------------------------------------------------------------------------
 
 
-class FluxModulation(nn.Module):
-    def __init__(self, dim, double, dtype=None, device=None):
+class FluxModulationOut(nn.Module):
+    """Container whose only submodule is ``linear`` -- an AWQ quantized linear.
+
+    This exists so the weight key path is ``norm1.linear.qweight``,
+    ``norm1.linear.wscales``, etc., matching nunchaku's format.
+    """
+
+    def __init__(self, hidden_size, out_multiplier, dtype=None, device=None, group_size=64):
         super().__init__()
-        self.is_double = double
-        multiplier = 6 if double else 3
-        self.lin = nn.Linear(dim, multiplier * dim, dtype=dtype, device=device)
-        self.act = nn.SiLU()
+        self.linear = AWQW4A16Linear(
+            hidden_size, out_multiplier * hidden_size,
+            bias=True, group_size=group_size,
+            torch_dtype=dtype, device=device,
+        )
 
-    def forward(self, vec):
-        out = self.lin(self.act(vec))[:, None, :]
-        return out.chunk(6 if self.is_double else 3, dim=-1)
+    def forward(self, x):
+        return self.linear(F.silu(x))
 
 
-# --- Transformer Blocks ---
+# ---------------------------------------------------------------------------
+# Double Stream Block
+# ---------------------------------------------------------------------------
 
 
 class FluxDoubleStreamBlock(nn.Module):
-    """FLUX double-stream transformer block with joint attention."""
+    """FLUX double-stream transformer block with joint attention.
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, qkv_bias=True, dtype=None, device=None, **kwargs):
+    Attribute names match nunchaku weight keys under ``transformer_blocks.{i}.*``:
+
+        norm1.linear.*          -- AWQ modulation for img (6 * hidden_size output)
+        norm1_context.linear.*  -- AWQ modulation for txt
+        qkv_proj.*              -- SVDQ img QKV [9216, 1536]
+        qkv_proj_context.*      -- SVDQ txt QKV
+        out_proj.*              -- SVDQ img attn output [3072, 1536]
+        out_proj_context.*      -- SVDQ txt attn output
+        mlp_fc1.*               -- SVDQ img MLP up [12288, 1536]
+        mlp_fc2.*               -- SVDQ img MLP down [3072, 6144]
+        mlp_context_fc1.*       -- SVDQ txt MLP up
+        mlp_context_fc2.*       -- SVDQ txt MLP down
+        norm_q.weight           -- RMSNorm [128]
+        norm_k.weight           -- RMSNorm [128]
+        norm_added_q.weight     -- RMSNorm txt Q [128]
+        norm_added_k.weight     -- RMSNorm txt K [128]
+    """
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, qkv_bias=True,
+                 dtype=None, device=None, **kwargs):
         super().__init__()
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         head_dim = hidden_size // num_heads
 
-        self.img_mod = FluxModulation(hidden_size, double=True, dtype=dtype, device=device)
-        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.img_attn_qkv = SVDQW4A4Linear(hidden_size, hidden_size * 3, bias=qkv_bias, torch_dtype=dtype, device=device, **kwargs)
-        self.img_attn_norm_q = nn.RMSNorm(head_dim, dtype=dtype, device=device)
-        self.img_attn_norm_k = nn.RMSNorm(head_dim, dtype=dtype, device=device)
-        self.img_attn_proj = SVDQW4A4Linear(hidden_size, hidden_size, torch_dtype=dtype, device=device, **kwargs)
-        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.img_mlp_0 = SVDQW4A4Linear(hidden_size, mlp_hidden_dim, torch_dtype=dtype, device=device, **kwargs)
-        self.img_mlp_2 = SVDQW4A4Linear(mlp_hidden_dim, hidden_size, torch_dtype=dtype, device=device, **kwargs)
+        quant_kwargs = {k: v for k, v in kwargs.items() if k in ("rank", "precision")}
 
-        self.txt_mod = FluxModulation(hidden_size, double=True, dtype=dtype, device=device)
-        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.txt_attn_qkv = SVDQW4A4Linear(hidden_size, hidden_size * 3, bias=qkv_bias, torch_dtype=dtype, device=device, **kwargs)
-        self.txt_attn_norm_q = nn.RMSNorm(head_dim, dtype=dtype, device=device)
-        self.txt_attn_norm_k = nn.RMSNorm(head_dim, dtype=dtype, device=device)
-        self.txt_attn_proj = SVDQW4A4Linear(hidden_size, hidden_size, torch_dtype=dtype, device=device, **kwargs)
-        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.txt_mlp_0 = SVDQW4A4Linear(hidden_size, mlp_hidden_dim, torch_dtype=dtype, device=device, **kwargs)
-        self.txt_mlp_2 = SVDQW4A4Linear(mlp_hidden_dim, hidden_size, torch_dtype=dtype, device=device, **kwargs)
+        # --- Image stream ---
+        # Pre-norm (not elementwise-affine, just standardization)
+        self.img_norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
+        self.img_norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
 
+        # Modulation -- output 6 * hidden_size (shift, scale, gate for attn + mlp)
+        self.norm1 = FluxModulationOut(hidden_size, 6, dtype=dtype, device=device)
+        # QKV projection
+        self.qkv_proj = SVDQW4A4Linear(
+            hidden_size, hidden_size * 3,
+            bias=qkv_bias, torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        # Q / K RMSNorm (per-head)
+        self.norm_q = nn.RMSNorm(head_dim, dtype=dtype, device=device)
+        self.norm_k = nn.RMSNorm(head_dim, dtype=dtype, device=device)
+        # Output projection
+        self.out_proj = SVDQW4A4Linear(
+            hidden_size, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        # MLP
+        self.mlp_fc1 = SVDQW4A4Linear(
+            hidden_size, mlp_hidden_dim,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        self.mlp_fc2 = SVDQW4A4Linear(
+            mlp_hidden_dim, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # --- Text / context stream ---
+        self.txt_norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
+        self.txt_norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
+
+        self.norm1_context = FluxModulationOut(hidden_size, 6, dtype=dtype, device=device)
+        self.qkv_proj_context = SVDQW4A4Linear(
+            hidden_size, hidden_size * 3,
+            bias=qkv_bias, torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        self.norm_added_q = nn.RMSNorm(head_dim, dtype=dtype, device=device)
+        self.norm_added_k = nn.RMSNorm(head_dim, dtype=dtype, device=device)
+        self.out_proj_context = SVDQW4A4Linear(
+            hidden_size, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        self.mlp_context_fc1 = SVDQW4A4Linear(
+            hidden_size, mlp_hidden_dim,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+        self.mlp_context_fc2 = SVDQW4A4Linear(
+            mlp_hidden_dim, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # Joint attention helper
         self.attn = FluxAttention(num_heads)
 
     def forward(self, img, txt, vec, pe):
-        img_mod1_shift, img_mod1_scale, img_mod1_gate, img_mod2_shift, img_mod2_scale, img_mod2_gate = self.img_mod(vec)
-        txt_mod1_shift, txt_mod1_scale, txt_mod1_gate, txt_mod2_shift, txt_mod2_scale, txt_mod2_gate = self.txt_mod(vec)
+        # --- Modulation ---
+        img_mod_out = self.norm1(vec)[:, None, :]  # [B, 1, 6*H]
+        (img_mod1_shift, img_mod1_scale, img_mod1_gate,
+         img_mod2_shift, img_mod2_scale, img_mod2_gate) = img_mod_out.chunk(6, dim=-1)
 
-        # Image attention
+        txt_mod_out = self.norm1_context(vec)[:, None, :]
+        (txt_mod1_shift, txt_mod1_scale, txt_mod1_gate,
+         txt_mod2_shift, txt_mod2_scale, txt_mod2_gate) = txt_mod_out.chunk(6, dim=-1)
+
+        # --- Image attention ---
         img_modulated = self.img_norm1(img) * (1 + img_mod1_scale) + img_mod1_shift
-        img_qkv = self.img_attn_qkv(img_modulated)
+        img_qkv = self.qkv_proj(img_modulated)
         img_q, img_k, img_v = img_qkv.chunk(3, dim=-1)
-        # [B, L, D] -> [B, L, H, D/H] for norm, keep per-head for RoPE
-        img_q = self.img_attn_norm_q(img_q.unflatten(-1, (self.num_heads, -1)))
-        img_k = self.img_attn_norm_k(img_k.unflatten(-1, (self.num_heads, -1)))
+        img_q = self.norm_q(img_q.unflatten(-1, (self.num_heads, -1)))
+        img_k = self.norm_k(img_k.unflatten(-1, (self.num_heads, -1)))
 
-        # Text attention
+        # --- Text attention ---
         txt_modulated = self.txt_norm1(txt) * (1 + txt_mod1_scale) + txt_mod1_shift
-        txt_qkv = self.txt_attn_qkv(txt_modulated)
+        txt_qkv = self.qkv_proj_context(txt_modulated)
         txt_q, txt_k, txt_v = txt_qkv.chunk(3, dim=-1)
-        txt_q = self.txt_attn_norm_q(txt_q.unflatten(-1, (self.num_heads, -1)))
-        txt_k = self.txt_attn_norm_k(txt_k.unflatten(-1, (self.num_heads, -1)))
+        txt_q = self.norm_added_q(txt_q.unflatten(-1, (self.num_heads, -1)))
+        txt_k = self.norm_added_k(txt_k.unflatten(-1, (self.num_heads, -1)))
 
-        # Joint attention with RoPE (applied per-head)
-        # [B, L_txt, H, D/H] cat [B, L_img, H, D/H] -> [B, L_total, H, D/H]
+        # --- Joint attention with RoPE ---
         q = torch.cat([txt_q, img_q], dim=1)
         k = torch.cat([txt_k, img_k], dim=1)
 
@@ -248,7 +351,6 @@ class FluxDoubleStreamBlock(nn.Module):
             q = apply_rope(q, pe)
             k = apply_rope(k, pe)
 
-        # Flatten back to [B, L, D] for attention
         q = q.flatten(-2)
         k = k.flatten(-2)
         v = torch.cat([txt_v, img_v], dim=1)
@@ -256,51 +358,101 @@ class FluxDoubleStreamBlock(nn.Module):
         attn = self.attn(q, k, v)
         txt_attn, img_attn = attn[:, :txt.shape[1]], attn[:, txt.shape[1]:]
 
-        # Output projections
-        img = img + img_mod1_gate * self.img_attn_proj(img_attn)
-        txt = txt + txt_mod1_gate * self.txt_attn_proj(txt_attn)
+        # --- Output projections ---
+        img = img + img_mod1_gate * self.out_proj(img_attn)
+        txt = txt + txt_mod1_gate * self.out_proj_context(txt_attn)
 
-        # MLP
-        img_mlp = self.img_mlp_0(self.img_norm2(img) * (1 + img_mod2_scale) + img_mod2_shift)
-        img_mlp = F.gelu(img_mlp, approximate="tanh")
-        img_mlp = self.img_mlp_2(img_mlp)
-        img = img + img_mod2_gate * img_mlp
+        # --- MLP ---
+        img_ff = self.mlp_fc1(self.img_norm2(img) * (1 + img_mod2_scale) + img_mod2_shift)
+        img_ff = F.gelu(img_ff, approximate="tanh")
+        img_ff = self.mlp_fc2(img_ff)
+        img = img + img_mod2_gate * img_ff
 
-        txt_mlp = self.txt_mlp_0(self.txt_norm2(txt) * (1 + txt_mod2_scale) + txt_mod2_shift)
-        txt_mlp = F.gelu(txt_mlp, approximate="tanh")
-        txt_mlp = self.txt_mlp_2(txt_mlp)
-        txt = txt + txt_mod2_gate * txt_mlp
+        txt_ff = self.mlp_context_fc1(self.txt_norm2(txt) * (1 + txt_mod2_scale) + txt_mod2_shift)
+        txt_ff = F.gelu(txt_ff, approximate="tanh")
+        txt_ff = self.mlp_context_fc2(txt_ff)
+        txt = txt + txt_mod2_gate * txt_ff
 
         return img, txt
 
 
-class FluxSingleStreamBlock(nn.Module):
-    """FLUX single-stream transformer block."""
+# ---------------------------------------------------------------------------
+# Single Stream Block
+# ---------------------------------------------------------------------------
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dtype=None, device=None, **kwargs):
+
+class FluxSingleStreamBlock(nn.Module):
+    """FLUX single-stream transformer block.
+
+    Attribute names match nunchaku weight keys under
+    ``single_transformer_blocks.{i}.*``:
+
+        norm.linear.*     -- AWQ modulation (3 * hidden_size)
+        qkv_proj.*        -- SVDQ QKV [9216, 1536]
+        mlp_fc1.*         -- SVDQ MLP up [12288, 1536]  (SEPARATE from qkv!)
+        mlp_fc2.*         -- SVDQ MLP down [3072, 6144]
+        out_proj.*        -- SVDQ output [3072, 1536] (SEPARATE!)
+        norm_q.weight     -- RMSNorm [128]
+        norm_k.weight     -- RMSNorm [128]
+    """
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0,
+                 dtype=None, device=None, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         head_dim = hidden_size // num_heads
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
 
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.mod = FluxModulation(hidden_size, double=False, dtype=dtype, device=device)
-        self.linear1 = SVDQW4A4Linear(hidden_size, hidden_size * 3 + mlp_hidden_dim, torch_dtype=dtype, device=device, **kwargs)
-        self.linear2 = SVDQW4A4Linear(hidden_size + mlp_hidden_dim, hidden_size, torch_dtype=dtype, device=device, **kwargs)
+        quant_kwargs = {k: v for k, v in kwargs.items() if k in ("rank", "precision")}
+
+        # Pre-norm
+        self.pre_norm = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
+
+        # Modulation (3 * hidden_size: shift, scale, gate)
+        self.norm = FluxModulationOut(hidden_size, 3, dtype=dtype, device=device)
+
+        # QKV projection (SEPARATE from MLP)
+        self.qkv_proj = SVDQW4A4Linear(
+            hidden_size, hidden_size * 3,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # MLP up (SEPARATE from QKV)
+        self.mlp_fc1 = SVDQW4A4Linear(
+            hidden_size, mlp_hidden_dim,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # MLP down
+        self.mlp_fc2 = SVDQW4A4Linear(
+            mlp_hidden_dim, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # Output projection (SEPARATE)
+        self.out_proj = SVDQW4A4Linear(
+            hidden_size, hidden_size,
+            torch_dtype=dtype, device=device, **quant_kwargs,
+        )
+
+        # Q / K RMSNorm
         self.norm_q = nn.RMSNorm(head_dim, dtype=dtype, device=device)
         self.norm_k = nn.RMSNorm(head_dim, dtype=dtype, device=device)
+
         self.attn = FluxAttention(num_heads)
 
     def forward(self, x, vec, pe):
-        mod_shift, mod_scale, mod_gate = self.mod(vec)
-        x_mod = self.norm(x) * (1 + mod_scale) + mod_shift
+        mod_out = self.norm(vec)[:, None, :]  # [B, 1, 3*H]
+        mod_shift, mod_scale, mod_gate = mod_out.chunk(3, dim=-1)
 
-        qkv_mlp = self.linear1(x_mod)
-        qkv, mlp = qkv_mlp.split([self.hidden_size * 3, qkv_mlp.shape[-1] - self.hidden_size * 3], dim=-1)
+        x_mod = self.pre_norm(x) * (1 + mod_scale) + mod_shift
+
+        # QKV (separate projection)
+        qkv = self.qkv_proj(x_mod)
         q, k, v = qkv.chunk(3, dim=-1)
-
-        # [B, L, D] -> [B, L, H, D/H] for norm + RoPE
         q = self.norm_q(q.unflatten(-1, (self.num_heads, -1)))
         k = self.norm_k(k.unflatten(-1, (self.num_heads, -1)))
 
@@ -312,11 +464,52 @@ class FluxSingleStreamBlock(nn.Module):
         k = k.flatten(-2)
 
         attn = self.attn(q, k, v)
-        output = self.linear2(torch.cat([attn, F.gelu(mlp, approximate="tanh")], dim=-1))
+
+        # MLP (separate projection)
+        mlp_out = self.mlp_fc1(x_mod)
+        mlp_out = F.gelu(mlp_out, approximate="tanh")
+        mlp_out = self.mlp_fc2(mlp_out)
+
+        # Combine attention + MLP through output projection
+        # In FLUX single blocks the residual is: x + gate * (attn_out + mlp_out)
+        # where attn_out and mlp_out go through separate out_proj
+        # Actually, the standard FLUX single block does:
+        #   output = out_proj(attn) + mlp_fc2(gelu(mlp_fc1(x_mod)))
+        output = self.out_proj(attn) + mlp_out
         return x + mod_gate * output
 
 
-# --- Main Transformer ---
+# ---------------------------------------------------------------------------
+# Final Layer (norm_out)
+# ---------------------------------------------------------------------------
+
+
+class FluxFinalLayer(nn.Module):
+    """Final adaptive-norm + linear projection.
+
+    Weight keys:
+        norm_out.linear.weight/bias  -- modulation linear (2 * hidden_size)
+        proj_out.weight/bias         -- final projection
+    """
+
+    def __init__(self, hidden_size, out_channels, dtype=None, device=None):
+        super().__init__()
+        self.norm = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
+        )
+        # The modulation linear lives at norm_out.linear in the weight file
+        self.linear = nn.Linear(hidden_size, hidden_size * 2, dtype=dtype, device=device)
+
+    def forward(self, x, vec):
+        mod = self.linear(F.silu(vec))[:, None, :]
+        shift, scale = mod.chunk(2, dim=-1)
+        x = self.norm(x) * (1 + scale) + shift
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Main Transformer
+# ---------------------------------------------------------------------------
 
 
 class XPUFluxTransformer2dModel(nn.Module):
@@ -324,11 +517,14 @@ class XPUFluxTransformer2dModel(nn.Module):
 
     Implements the same interface as NunchakuFluxTransformer2dModel
     but uses pure Python + omni_xpu_kernel instead of C++ CUDA kernels.
+
+    All attribute names are chosen to match the nunchaku safetensors weight keys
+    exactly so that ``load_state_dict`` works without key remapping.
     """
 
     # Default FLUX architecture config
     DEFAULT_CONFIG = {
-        "in_channels": 64,
+        "in_channels": 64,       # after patch embedding (not raw 16)
         "out_channels": 64,
         "hidden_size": 3072,
         "num_heads": 24,
@@ -355,23 +551,37 @@ class XPUFluxTransformer2dModel(nn.Module):
 
         quant_kwargs = {k: v for k, v in kwargs.items() if k in ("rank", "precision")}
 
-        # Embeddings
-        self.x_embedder = nn.Linear(cfg["in_channels"], cfg["hidden_size"], dtype=torch_dtype, device=device)
-        self.t_embedder = TimestepEmbedding(256, cfg["hidden_size"], dtype=torch_dtype, device=device)
-        self.time_proj = Timesteps(256)
+        # --- Embeddings ---
+        # Weight keys: x_embedder.weight/bias
+        self.x_embedder = nn.Linear(
+            cfg["in_channels"], cfg["hidden_size"], dtype=torch_dtype, device=device
+        )
 
+        # Weight keys: time_text_embed.timestep_embedder.*, time_text_embed.text_embedder.*
         if cfg.get("guidance_embed", False):
-            self.guidance_embedder = TimestepEmbedding(256, cfg["hidden_size"], dtype=torch_dtype, device=device)
+            self.time_text_embed = CombinedTimestepGuidanceTextProjEmbeddings(
+                cfg["hidden_size"], cfg["pooled_projection_dim"],
+                dtype=torch_dtype, device=device,
+            )
         else:
-            self.guidance_embedder = None
+            self.time_text_embed = CombinedTimestepTextProjEmbeddings(
+                cfg["hidden_size"], cfg["pooled_projection_dim"],
+                dtype=torch_dtype, device=device,
+            )
 
-        self.y_embedder = nn.Linear(cfg["pooled_projection_dim"], cfg["hidden_size"], dtype=torch_dtype, device=device)
-        self.context_embedder = nn.Linear(cfg["context_in_dim"], cfg["hidden_size"], dtype=torch_dtype, device=device)
+        # Weight keys: context_embedder.weight/bias
+        self.context_embedder = nn.Linear(
+            cfg["context_in_dim"], cfg["hidden_size"], dtype=torch_dtype, device=device
+        )
 
-        self.pe_embedder = EmbedND(cfg["hidden_size"] // cfg["num_heads"], cfg["theta"], cfg["axes_dim"])
+        # Positional embeddings (no learnable parameters)
+        self.pe_embedder = EmbedND(
+            cfg["hidden_size"] // cfg["num_heads"], cfg["theta"], cfg["axes_dim"]
+        )
 
-        # Transformer blocks
-        self.double_blocks = nn.ModuleList([
+        # --- Double-stream transformer blocks ---
+        # Weight keys: transformer_blocks.{i}.*
+        self.transformer_blocks = nn.ModuleList([
             FluxDoubleStreamBlock(
                 cfg["hidden_size"], cfg["num_heads"], cfg["mlp_ratio"],
                 qkv_bias=cfg.get("qkv_bias", True),
@@ -379,7 +589,10 @@ class XPUFluxTransformer2dModel(nn.Module):
             )
             for _ in range(cfg["num_double_blocks"])
         ])
-        self.single_blocks = nn.ModuleList([
+
+        # --- Single-stream transformer blocks ---
+        # Weight keys: single_transformer_blocks.{i}.*
+        self.single_transformer_blocks = nn.ModuleList([
             FluxSingleStreamBlock(
                 cfg["hidden_size"], cfg["num_heads"], cfg["mlp_ratio"],
                 dtype=torch_dtype, device=device, **quant_kwargs,
@@ -387,25 +600,30 @@ class XPUFluxTransformer2dModel(nn.Module):
             for _ in range(cfg["num_single_blocks"])
         ])
 
-        # Output
-        self.norm_out = nn.LayerNorm(cfg["hidden_size"], elementwise_affine=False, eps=1e-6, dtype=torch_dtype, device=device)
-        self.proj_out = nn.Linear(cfg["hidden_size"], cfg["in_channels"], dtype=torch_dtype, device=device)
-        # Modulation for final layer
-        self.final_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cfg["hidden_size"], cfg["hidden_size"] * 2, dtype=torch_dtype, device=device),
+        # --- Output ---
+        # Weight keys: norm_out.linear.weight/bias
+        self.norm_out = FluxFinalLayer(
+            cfg["hidden_size"], cfg["in_channels"], dtype=torch_dtype, device=device,
+        )
+        # Weight keys: proj_out.weight/bias
+        self.proj_out = nn.Linear(
+            cfg["hidden_size"], cfg["in_channels"], dtype=torch_dtype, device=device
         )
 
-        # LoRA support
+        # --- LoRA support ---
         self.comfy_lora_meta_list = []
         self.comfy_lora_sd_list = []
 
-        # Caching support
+        # --- Caching support ---
         self.residual_diff_threshold_multi = 0
         self._is_cached = False
 
         # Attention implementation (unused on XPU, always uses PyTorch SDPA)
         self._attention_impl = "sdpa"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def set_attention_impl(self, impl):
         """Set attention implementation (for API compatibility)."""
@@ -414,10 +632,9 @@ class XPUFluxTransformer2dModel(nn.Module):
 
     def reset_lora(self):
         """Reset all LoRA parameters."""
-        for block in list(self.double_blocks) + list(self.single_blocks):
+        for block in list(self.transformer_blocks) + list(self.single_transformer_blocks):
             for module in block.modules():
                 if isinstance(module, SVDQW4A4Linear):
-                    # Reset LoRA projections to zero effect
                     if module.proj_down is not None:
                         module.proj_down.zero_()
                     if module.proj_up is not None:
@@ -447,7 +664,13 @@ class XPUFluxTransformer2dModel(nn.Module):
         for module in self.modules():
             if isinstance(module, SVDQW4A4Linear):
                 module.prepare_weights()
-        logger.info("All SVDQW4A4Linear weights prepared for XPU inference")
+            elif isinstance(module, AWQW4A16Linear):
+                module.invalidate_cache()
+        logger.info("All quantized weights prepared for XPU inference")
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -466,12 +689,11 @@ class XPUFluxTransformer2dModel(nn.Module):
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        timesteps_proj = self.time_proj(timestep)
-        vec = self.t_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
-        if guidance is not None and self.guidance_embedder is not None:
-            guidance_proj = self.time_proj(guidance)
-            vec = vec + self.guidance_embedder(guidance_proj.to(dtype=hidden_states.dtype))
-        vec = vec + self.y_embedder(pooled_projections)
+        # Time + text embedding
+        if guidance is not None and hasattr(self.time_text_embed, 'guidance_embedder'):
+            vec = self.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            vec = self.time_text_embed(timestep, pooled_projections)
 
         # Positional embeddings
         ids = torch.cat([txt_ids, img_ids], dim=1)
@@ -480,7 +702,7 @@ class XPUFluxTransformer2dModel(nn.Module):
         # Double stream blocks
         img = hidden_states
         txt = encoder_hidden_states
-        for i, block in enumerate(self.double_blocks):
+        for i, block in enumerate(self.transformer_blocks):
             img, txt = block(img, txt, vec, pe)
             if controlnet_block_samples is not None and i < len(controlnet_block_samples):
                 ctrl = controlnet_block_samples[i]
@@ -491,7 +713,7 @@ class XPUFluxTransformer2dModel(nn.Module):
         x = torch.cat([txt, img], dim=1)
 
         # Single stream blocks
-        for i, block in enumerate(self.single_blocks):
+        for i, block in enumerate(self.single_transformer_blocks):
             x = block(x, vec, pe)
             if controlnet_single_block_samples is not None and i < len(controlnet_single_block_samples):
                 ctrl = controlnet_single_block_samples[i]
@@ -502,12 +724,14 @@ class XPUFluxTransformer2dModel(nn.Module):
         img = x[:, txt.shape[1]:]
 
         # Final layer
-        final_mod = self.final_mod(vec)[:, None, :]
-        shift, scale = final_mod.chunk(2, dim=-1)
-        img = self.norm_out(img) * (1 + scale) + shift
+        img = self.norm_out(img, vec)
         img = self.proj_out(img)
 
         return FluxOutput(sample=img)
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_pretrained(
@@ -520,6 +744,13 @@ class XPUFluxTransformer2dModel(nn.Module):
         **kwargs,
     ):
         """Load a FLUX model from nunchaku-format safetensors.
+
+        The model directory should contain:
+            - unquantized_layers.safetensors (embeddings, norms, proj_out)
+            - transformer_blocks.safetensors (double + single blocks)
+            - Optionally: comfy_config.json
+
+        Or a single safetensors file combining everything.
 
         Parameters
         ----------
@@ -540,23 +771,52 @@ class XPUFluxTransformer2dModel(nn.Module):
         """
         from safetensors.torch import load_file
 
+        metadata = {}
+
         if os.path.isdir(path):
-            # Look for safetensors file in directory
-            candidates = ["quantized_model.safetensors", "model.safetensors"]
-            safetensors_path = None
-            for c in candidates:
-                p = os.path.join(path, c)
-                if os.path.exists(p):
-                    safetensors_path = p
-                    break
-            if safetensors_path is None:
-                # Try any .safetensors file
-                for f in os.listdir(path):
-                    if f.endswith(".safetensors"):
-                        safetensors_path = os.path.join(path, f)
+            # Collect state dict from all safetensors files in directory
+            state_dict = {}
+
+            # Try loading separate files
+            unquant_path = os.path.join(path, "unquantized_layers.safetensors")
+            blocks_path = os.path.join(path, "transformer_blocks.safetensors")
+
+            if os.path.exists(unquant_path) and os.path.exists(blocks_path):
+                logger.info(f"Loading unquantized layers from {unquant_path}")
+                state_dict.update(load_file(unquant_path, device="cpu"))
+                logger.info(f"Loading transformer blocks from {blocks_path}")
+                state_dict.update(load_file(blocks_path, device="cpu"))
+            else:
+                # Fallback: look for any safetensors files
+                candidates = ["quantized_model.safetensors", "model.safetensors"]
+                safetensors_path = None
+                for c in candidates:
+                    p = os.path.join(path, c)
+                    if os.path.exists(p):
+                        safetensors_path = p
                         break
-            if safetensors_path is None:
-                raise FileNotFoundError(f"No safetensors file found in {path}")
+                if safetensors_path is None:
+                    for f in sorted(os.listdir(path)):
+                        if f.endswith(".safetensors"):
+                            safetensors_path = os.path.join(path, f)
+                            break
+                if safetensors_path is None:
+                    raise FileNotFoundError(f"No safetensors file found in {path}")
+                logger.info(f"Loading FLUX model from {safetensors_path}")
+                state_dict = load_file(safetensors_path, device="cpu")
+
+            # Read metadata from any safetensors file
+            try:
+                from safetensors import safe_open
+                for fname in ["transformer_blocks.safetensors", "unquantized_layers.safetensors"]:
+                    fpath = os.path.join(path, fname)
+                    if os.path.exists(fpath):
+                        with safe_open(fpath, framework="pt") as f:
+                            if f.metadata():
+                                metadata.update(dict(f.metadata()))
+                        break
+            except Exception:
+                pass
 
             # Load config
             config_path = os.path.join(path, "comfy_config.json")
@@ -566,23 +826,19 @@ class XPUFluxTransformer2dModel(nn.Module):
             else:
                 comfy_config = None
         else:
-            safetensors_path = path
+            logger.info(f"Loading FLUX model from {path}")
+            state_dict = load_file(path, device="cpu")
             comfy_config = None
-
-        logger.info(f"Loading FLUX model from {safetensors_path}")
-        state_dict = load_file(safetensors_path, device="cpu")
+            try:
+                from safetensors import safe_open
+                with safe_open(path, framework="pt") as f:
+                    if f.metadata():
+                        metadata = dict(f.metadata())
+            except Exception:
+                pass
 
         # Detect model config from state dict
         config = cls._detect_config(state_dict, comfy_config)
-
-        # Read metadata from safetensors
-        metadata = None
-        try:
-            from safetensors import safe_open
-            with safe_open(safetensors_path, framework="pt") as f:
-                metadata = dict(f.metadata()) if f.metadata() else {}
-        except Exception:
-            metadata = {}
 
         # Extract quantization config
         quant_config = {}
@@ -596,15 +852,23 @@ class XPUFluxTransformer2dModel(nn.Module):
         model = cls(
             config=config,
             torch_dtype=torch_dtype,
-            device="cpu",  # Load on CPU first
+            device="cpu",
             rank=rank,
             precision=precision,
         )
 
-        # Load state dict
-        model._load_nunchaku_state_dict(state_dict, torch_dtype)
+        # Load state dict with strict=False (allows missing/unexpected keys to be reported)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.debug(f"Missing keys ({len(missing)}): {missing[:20]}...")
+        if unexpected:
+            logger.debug(f"Unexpected keys ({len(unexpected)}): {unexpected[:20]}...")
+        logger.info(
+            f"Loaded state dict: {len(state_dict)} keys, "
+            f"{len(missing)} missing, {len(unexpected)} unexpected"
+        )
 
-        # Prepare weights for oneDNN
+        # Move to device and prepare weights
         if device is not None:
             model = model.to(device)
         model.prepare_all_weights()
@@ -629,10 +893,10 @@ class XPUFluxTransformer2dModel(nn.Module):
         double_blocks = set()
         single_blocks = set()
         for key in state_dict.keys():
-            if key.startswith("double_blocks."):
+            if key.startswith("transformer_blocks."):
                 idx = int(key.split(".")[1])
                 double_blocks.add(idx)
-            elif key.startswith("single_blocks."):
+            elif key.startswith("single_transformer_blocks."):
                 idx = int(key.split(".")[1])
                 single_blocks.add(idx)
 
@@ -651,60 +915,14 @@ class XPUFluxTransformer2dModel(nn.Module):
         config["num_heads"] = config["hidden_size"] // 128  # head_dim=128 for FLUX
 
         # Detect guidance embed
-        config["guidance_embed"] = any(k.startswith("guidance_embedder.") or k.startswith("guidance_in.") for k in state_dict)
+        has_guidance = any(
+            k.startswith("time_text_embed.guidance_embedder.") for k in state_dict
+        )
+        config["guidance_embed"] = has_guidance
+
+        # Detect pooled_projection_dim from text_embedder
+        text_emb_key = "time_text_embed.text_embedder.linear_1.weight"
+        if text_emb_key in state_dict:
+            config["pooled_projection_dim"] = state_dict[text_emb_key].shape[1]
 
         return config
-
-    def _load_nunchaku_state_dict(self, state_dict, torch_dtype):
-        """Load nunchaku-format quantized state dict into the model."""
-        loaded = set()
-
-        for name, module in self.named_modules():
-            if isinstance(module, SVDQW4A4Linear):
-                prefix = name + "."
-                # Load quantized params
-                for param_name in ["qweight", "wscales", "wcscales", "wtscale",
-                                   "smooth_factor", "smooth_factor_orig",
-                                   "proj_down", "proj_up", "bias"]:
-                    key = prefix + param_name
-                    if key in state_dict:
-                        tensor = state_dict[key]
-                        if param_name in ("qweight",):
-                            # Keep uint8
-                            getattr(module, param_name).data = tensor
-                        elif param_name in ("wcscales", "wtscale"):
-                            setattr(module, param_name, tensor.to(torch_dtype))
-                        else:
-                            buf = getattr(module, param_name, None)
-                            if buf is not None:
-                                buf.data = tensor.to(buf.dtype)
-                            else:
-                                setattr(module, param_name, tensor.to(torch_dtype))
-                        loaded.add(key)
-
-            elif isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm)):
-                prefix = name + "."
-                for param_name in ["weight", "bias"]:
-                    key = prefix + param_name
-                    if key in state_dict:
-                        param = getattr(module, param_name, None)
-                        if param is not None:
-                            param.data = state_dict[key].to(param.dtype)
-                        loaded.add(key)
-
-        # Handle modulation layers (may be AWQ quantized in nunchaku)
-        for name, module in self.named_modules():
-            if isinstance(module, FluxModulation):
-                key = name + ".lin.weight"
-                if key in state_dict:
-                    module.lin.weight.data = state_dict[key].to(module.lin.weight.dtype)
-                    loaded.add(key)
-                key = name + ".lin.bias"
-                if key in state_dict:
-                    module.lin.bias.data = state_dict[key].to(module.lin.bias.dtype)
-                    loaded.add(key)
-
-        unloaded = set(state_dict.keys()) - loaded
-        if unloaded:
-            logger.debug(f"Unloaded keys ({len(unloaded)}): {list(unloaded)[:20]}...")
-        logger.info(f"Loaded {len(loaded)}/{len(state_dict)} keys from state dict")

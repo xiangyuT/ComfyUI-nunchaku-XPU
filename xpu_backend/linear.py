@@ -22,6 +22,15 @@ class SVDQW4A4Linear(nn.Module):
 
     Uses omni_xpu_kernel.svdq for INT4 weight GEMM on XPU.
     Maintains the same interface as nunchaku.models.linear.SVDQW4A4Linear.
+
+    Nunchaku weight key mapping:
+        qweight     -> self.qweight       (torch.int8, [out_features, in_features//2])
+        wscales     -> self.wscales        (bf16, [in_features//64, out_features])
+        smooth      -> self.smooth_factor  (bf16, [in_features])
+        smooth_orig -> self.smooth_factor_orig (bf16, [in_features])
+        lora_down   -> self.proj_down      (bf16, [in_features, rank])
+        lora_up     -> self.proj_up        (bf16, [out_features, rank])
+        bias        -> self.bias           (bf16, [out_features])
     """
 
     def __init__(
@@ -44,10 +53,10 @@ class SVDQW4A4Linear(nn.Module):
         self.act_unsigned = act_unsigned
         self.dtype = torch_dtype
 
-        # Quantized weight: [out_features, in_features // 2] uint8
+        # Quantized weight: [out_features, in_features // 2] int8 (packed INT4)
         self.register_buffer(
             "qweight",
-            torch.zeros(out_features, in_features // 2, dtype=torch.uint8, device=device),
+            torch.zeros(out_features, in_features // 2, dtype=torch.int8, device=device),
         )
         # Per-group weight scales: [num_groups, out_features]
         num_groups = in_features // 64  # group_size = 64
@@ -61,13 +70,14 @@ class SVDQW4A4Linear(nn.Module):
         self.register_buffer(
             "wtscale", torch.ones(1, dtype=torch_dtype, device=device)
         )
-        # Smooth factor for activation
+        # Smooth factor for activation (nunchaku key: "smooth")
         self.register_buffer("smooth_factor", None)
+        # Smooth factor original (nunchaku key: "smooth_orig")
         self.register_buffer("smooth_factor_orig", None)
-        # LoRA projections (packed format)
+        # LoRA projections (nunchaku keys: "lora_down", "lora_up")
         self.register_buffer(
             "proj_down",
-            torch.zeros(rank, in_features, dtype=torch_dtype, device=device),
+            torch.zeros(in_features, rank, dtype=torch_dtype, device=device),
         )
         self.register_buffer(
             "proj_up",
@@ -86,17 +96,60 @@ class SVDQW4A4Linear(nn.Module):
         self._wscales_f16 = None
         self._rcp_smooth = None
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Override to handle nunchaku weight key aliases during load_state_dict.
+
+        Maps:
+            smooth      -> smooth_factor
+            smooth_orig -> smooth_factor_orig
+            lora_down   -> proj_down
+            lora_up     -> proj_up
+
+        Also handles the case where smooth_factor / smooth_factor_orig are
+        registered as ``None`` buffers: we must re-register them with a real
+        tensor *before* the parent ``_load_from_state_dict`` runs, otherwise
+        PyTorch skips loading into ``None`` buffers.
+        """
+        alias_map = {
+            "smooth": "smooth_factor",
+            "smooth_orig": "smooth_factor_orig",
+            "lora_down": "proj_down",
+            "lora_up": "proj_up",
+        }
+        # Remap aliased keys before calling parent
+        for alias, canonical in alias_map.items():
+            alias_key = prefix + alias
+            canonical_key = prefix + canonical
+            if alias_key in state_dict and canonical_key not in state_dict:
+                state_dict[canonical_key] = state_dict.pop(alias_key)
+
+        # If smooth_factor / smooth_factor_orig are currently None but the
+        # state_dict has values for them, pre-register empty buffers so that
+        # the parent _load_from_state_dict can assign into them.
+        none_buffers = {"smooth_factor", "smooth_factor_orig"}
+        for buf_name in none_buffers:
+            key = prefix + buf_name
+            if key in state_dict and getattr(self, buf_name) is None:
+                self.register_buffer(buf_name, torch.empty_like(state_dict[key]))
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
     def _ensure_prepared(self):
         """Prepare weights for oneDNN on first use."""
         if self._qweight_u4 is None and self.qweight is not None:
+            # Convert int8 -> uint8 first (nunchaku stores as int8, oneDNN needs uint8)
+            qweight_u8 = self.qweight.view(torch.uint8)
             try:
                 from omni_xpu_kernel.svdq import prepare_onednn_weights
                 self._qweight_u4, self._wscales_f16 = prepare_onednn_weights(
-                    self.qweight, self.wscales
+                    qweight_u8, self.wscales
                 )
             except ImportError:
-                # Fallback: manual conversion
-                self._qweight_u4 = (self.qweight ^ 0x88).contiguous()
+                # Fallback: manual conversion (XOR 0x88 for signed->unsigned INT4)
+                self._qweight_u4 = (qweight_u8 ^ 0x88).contiguous()
                 self._wscales_f16 = self.wscales.to(torch.float16).contiguous()
         if self._rcp_smooth is None and self.smooth_factor is not None:
             self._rcp_smooth = (1.0 / self.smooth_factor.float()).to(torch.float16)
@@ -168,7 +221,7 @@ class SVDQW4A4Linear(nn.Module):
         # LoRA down projection
         lora_act = None
         if self.proj_down is not None:
-            lora_act = x.to(torch.float16) @ self.proj_down.to(torch.float16).T
+            lora_act = x.to(torch.float16) @ self.proj_down.to(torch.float16)
 
         return packed_act, ascales, lora_act
 
@@ -215,7 +268,7 @@ class SVDQW4A4Linear(nn.Module):
         """Fallback: dequantize everything and use standard matmul."""
         from omni_xpu_kernel.svdq import dequantize_w4
         act_f16 = dequantize_w4(quantized_x, ascales.T, torch.float16)
-        wgt_f16 = dequantize_w4(self.qweight, self.wscales, torch.float16)
+        wgt_f16 = dequantize_w4(self.qweight.to(torch.uint8), self.wscales, torch.float16)
         return act_f16 @ wgt_f16.T
 
     def forward(self, x):
@@ -241,7 +294,7 @@ class SVDQW4A4Linear(nn.Module):
 
             # LoRA correction
             if self.proj_down is not None and self.proj_up is not None:
-                lora_act = x.to(torch.float16) @ self.proj_down.to(torch.float16).T
+                lora_act = x.to(torch.float16) @ self.proj_down.to(torch.float16)
                 lora_out = lora_act @ self.proj_up.to(torch.float16).T
                 lora_out = lora_out * self.wtscale.to(torch.float16)
                 result = result + lora_out
@@ -266,14 +319,14 @@ class SVDQW4A4Linear(nn.Module):
         """Full dequantization fallback (slow but always works)."""
         try:
             from omni_xpu_kernel.svdq import dequantize_w4
-            weight = dequantize_w4(self.qweight, self.wscales, self.dtype)
+            weight = dequantize_w4(self.qweight.to(torch.uint8), self.wscales, self.dtype)
         except ImportError:
             weight = self._manual_dequant()
 
         result = x.to(self.dtype) @ weight.T
 
         if self.proj_down is not None and self.proj_up is not None:
-            lora_act = x.to(self.dtype) @ self.proj_down.to(self.dtype).T
+            lora_act = x.to(self.dtype) @ self.proj_down.to(self.dtype)
             lora_out = lora_act @ self.proj_up.to(self.dtype).T * self.wtscale
             result = result + lora_out
 
@@ -283,14 +336,21 @@ class SVDQW4A4Linear(nn.Module):
         return result
 
     def _manual_dequant(self):
-        """Manually dequantize INT4 weights (pure PyTorch, no kernels)."""
+        """Manually dequantize INT4 weights (pure PyTorch, no kernels).
+
+        qweight is int8, each byte holds 2 packed int4 values (signed).
+        """
         N, half_K = self.qweight.shape
         K = half_K * 2
         group_size = 64
 
-        # Unpack INT4: low nibble = even indices, high nibble = odd indices
-        low = (self.qweight & 0x0F).to(torch.int8) - 8  # signed
-        high = ((self.qweight >> 4) & 0x0F).to(torch.int8) - 8
+        # Unpack INT4 from int8: low nibble = even indices, high nibble = odd indices
+        qw = self.qweight.to(torch.int16)  # widen to avoid overflow
+        low = (qw & 0x0F).to(torch.int8)
+        high = ((qw >> 4) & 0x0F).to(torch.int8)
+        # Convert unsigned nibble to signed: if >= 8, subtract 16
+        low = torch.where(low >= 8, low - 16, low)
+        high = torch.where(high >= 8, high - 16, high)
 
         # Interleave
         weight_int = torch.stack([low, high], dim=-1).reshape(N, K)
@@ -309,8 +369,14 @@ class SVDQW4A4Linear(nn.Module):
 class AWQW4A16Linear(nn.Module):
     """AWQ W4A16 quantized linear layer for Intel XPU.
 
-    Dequantizes INT4 weights to float and performs standard matmul.
-    On CUDA, nunchaku uses optimized AWQ GEMV kernels.
+    Supports the nunchaku safetensors format where:
+        qweight: int32, [out_features//4, in_features//2] - packed INT4 weights
+        wscales: bf16, [in_features//group_size, out_features] - per-group scales
+        wzeros:  bf16, [in_features//group_size, out_features] - per-group zeros (float)
+        bias:    bf16, [out_features]
+
+    Packing: each int32 stores 4 int4 values along out_features, and in_features is
+    packed 2:1 (each position stores 2 int4 values), so total 8 int4 per int32.
     """
 
     def __init__(
@@ -329,21 +395,23 @@ class AWQW4A16Linear(nn.Module):
         self.group_size = group_size
         self.dtype = torch_dtype
 
-        # AWQ weight format
+        # AWQ weight: [out_features // 4, in_features // 2] int32
         self.register_buffer(
             "qweight",
-            torch.zeros(in_features // 8, out_features, dtype=torch.int32, device=device),
+            torch.zeros(out_features // 4, in_features // 2, dtype=torch.int32, device=device),
         )
+        # Per-group scales: [in_features // group_size, out_features]
         self.register_buffer(
-            "scales",
+            "wscales",
             torch.zeros(
                 in_features // group_size, out_features, dtype=torch_dtype, device=device
             ),
         )
+        # Per-group zeros as bf16 float (nunchaku format)
         self.register_buffer(
-            "qzeros",
+            "wzeros",
             torch.zeros(
-                in_features // group_size, out_features // 8, dtype=torch.int32, device=device
+                in_features // group_size, out_features, dtype=torch_dtype, device=device
             ),
         )
         if bias:
@@ -355,30 +423,71 @@ class AWQW4A16Linear(nn.Module):
 
         self._dequantized_weight = None
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Handle legacy key names and shape differences during load."""
+        # Handle legacy 'scales' -> 'wscales'
+        scales_key = prefix + "scales"
+        wscales_key = prefix + "wscales"
+        if scales_key in state_dict and wscales_key not in state_dict:
+            state_dict[wscales_key] = state_dict.pop(scales_key)
+
+        # Handle legacy int32 'qzeros' -> convert to float 'wzeros'
+        qzeros_key = prefix + "qzeros"
+        wzeros_key = prefix + "wzeros"
+        if qzeros_key in state_dict and wzeros_key not in state_dict:
+            qzeros = state_dict.pop(qzeros_key)
+            if qzeros.dtype == torch.int32:
+                num_groups = qzeros.shape[0]
+                N = self.out_features
+                zeros = torch.zeros(num_groups, N, dtype=self.dtype, device=qzeros.device)
+                for i in range(8):
+                    zeros[:, i::8] = ((qzeros >> (i * 4)) & 0xF).to(self.dtype)
+                state_dict[wzeros_key] = zeros
+            else:
+                state_dict[wzeros_key] = qzeros
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
     def _dequantize(self):
-        """Dequantize AWQ weights to float. Cached after first call."""
+        """Dequantize AWQ weights to float. Cached after first call.
+
+        qweight layout: [out_features//4, in_features//2] int32
+        Each int32 packs 8 int4 values: 4 along out_features × 2 along in_features.
+        Unpacked weight is [out_features, in_features].
+        """
         if self._dequantized_weight is not None:
             return self._dequantized_weight
 
-        K = self.in_features
-        N = self.out_features
+        # qweight: [N//4, K//2] int32, where N=out_features, K=in_features
+        N_packed = self.qweight.shape[0]  # out_features // 4
+        K_packed = self.qweight.shape[1]  # in_features // 2
+        N = N_packed * 4
+        K = K_packed * 2
 
-        # Unpack qweight: int32 -> 8 x int4
-        weight = torch.zeros(K, N, dtype=self.dtype, device=self.qweight.device)
-        for i in range(8):
-            weight[i::8] = ((self.qweight >> (i * 4)) & 0xF).to(self.dtype)
+        # Unpack qweight: [N//4, K//2] int32 -> [N, K]
+        # Each int32 at [n, k] packs 4 output features × 2 input features:
+        #   bits [4*i + 4*2*j] for output 4n+j, input 2k+i
+        # Standard AWQ unpack: 8 int4 values per int32, interleaved
+        weight = torch.zeros(N, K, dtype=self.dtype, device=self.qweight.device)
+        for j in range(4):    # output sub-index
+            for i in range(2):  # input sub-index
+                shift = (j * 2 + i) * 4
+                vals = ((self.qweight >> shift) & 0xF).to(self.dtype)  # [N//4, K//2]
+                weight[j::4, i::2] = vals
 
-        # Unpack qzeros
+        # wzeros is already float: [K//group_size, N]
+        zeros = self.wzeros.to(self.dtype)
+
+        # Dequantize: weight[n, k] = (int4[n,k] - zeros[g, n]) * scales[g, n]
+        # wscales, wzeros: [K//group_size, N]
         num_groups = K // self.group_size
-        zeros = torch.zeros(num_groups, N, dtype=self.dtype, device=self.qzeros.device)
-        for i in range(8):
-            zeros[:, i::8] = ((self.qzeros >> (i * 4)) & 0xF).to(self.dtype)
-
-        # Dequantize: weight = (int4 - zero) * scale
         for g in range(num_groups):
             start = g * self.group_size
             end = start + self.group_size
-            weight[start:end] = (weight[start:end] - zeros[g:g+1]) * self.scales[g:g+1]
+            weight[:, start:end] = (weight[:, start:end] - zeros[g:g+1].T) * self.wscales[g:g+1].T
 
         self._dequantized_weight = weight
         return weight
@@ -388,9 +497,13 @@ class AWQW4A16Linear(nn.Module):
         self._dequantized_weight = None
 
     def forward(self, x):
-        """Forward pass: dequantize weights and matmul."""
-        weight = self._dequantize()
-        result = x.to(self.dtype) @ weight
+        """Forward pass: dequantize weights and matmul.
+
+        x: [..., in_features]
+        output: [..., out_features]
+        """
+        weight = self._dequantize()  # [out_features, in_features]
+        result = x.to(self.dtype) @ weight.T
 
         if self.bias is not None:
             result = result + self.bias
