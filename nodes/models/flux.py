@@ -13,12 +13,16 @@ import comfy.model_patcher
 import torch
 from comfy.supported_models import Flux, FluxSchnell
 
-from nunchaku import NunchakuFluxTransformer2dModel
-from nunchaku.caching.diffusers_adapters.flux import apply_cache_on_transformer
-from nunchaku.utils import is_turing
-
+from ...xpu_backend import is_xpu
+from ...xpu_backend.device import get_device, get_device_count, get_device_name, get_device_properties, get_gpu_memory, is_turing
 from ...wrappers.flux import ComfyFluxWrapper
 from ..utils import get_filename_list, get_full_path_or_raise
+
+if is_xpu():
+    from ...xpu_backend.flux_transformer import XPUFluxTransformer2dModel as FluxTransformerModel
+else:
+    from nunchaku import NunchakuFluxTransformer2dModel as FluxTransformerModel
+    from nunchaku.caching.diffusers_adapters.flux import apply_cache_on_transformer
 
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -31,34 +35,10 @@ logger = logging.getLogger(__name__)
 class NunchakuFluxDiTLoader:
     """
     Loader for Nunchaku FLUX.1 models.
-
-    This class manages model loading, device selection, attention implementation,
-    CPU offload, and caching for efficient inference.
-
-    Attributes
-    ----------
-    transformer : :class:`~nunchaku.models.transformers.transformer_flux.NunchakuFluxTransformer2dModel` or None
-        The loaded transformer model.
-    metadata : dict or None
-        Metadata associated with the loaded model.
-    model_path : str or None
-        Path to the loaded model.
-    device : torch.device or None
-        Device on which the model is loaded.
-    cpu_offload : bool or None
-        Whether CPU offload is enabled.
-    data_type : str or None
-        Data type used for inference.
-    patcher : object or None
-        ComfyUI model patcher instance.
+    Supports both CUDA (via nunchaku) and Intel XPU (via omni_xpu_kernel).
     """
 
     def __init__(self):
-        """
-        Initialize the NunchakuFluxDiTLoader.
-
-        Sets up internal state and selects the default torch device.
-        """
         self.transformer = None
         self.metadata = None
         self.model_path = None
@@ -70,29 +50,26 @@ class NunchakuFluxDiTLoader:
 
     @classmethod
     def INPUT_TYPES(s):
-        """
-        Define the input types and tooltips for the node.
-
-        Returns
-        -------
-        dict
-            A dictionary specifying the required inputs and their descriptions for the node interface.
-        """
         safetensor_files = get_filename_list("diffusion_models")
 
-        ngpus = torch.cuda.device_count()
+        ngpus = max(get_device_count(), 1)
 
-        all_turing = True
-        for i in range(torch.cuda.device_count()):
-            if not is_turing(f"cuda:{i}"):
-                all_turing = False
-
-        if all_turing:
-            attention_options = ["nunchaku-fp16"]  # turing GPUs do not support flashattn2
-            dtype_options = ["float16"]
-        else:
-            attention_options = ["nunchaku-fp16", "flash-attention2"]
+        if is_xpu():
+            # XPU: use PyTorch SDPA, support bfloat16
+            attention_options = ["sdpa"]
             dtype_options = ["bfloat16", "float16"]
+        else:
+            all_turing = True
+            for i in range(get_device_count()):
+                if not is_turing(f"cuda:{i}"):
+                    all_turing = False
+
+            if all_turing:
+                attention_options = ["nunchaku-fp16"]
+                dtype_options = ["float16"]
+            else:
+                attention_options = ["nunchaku-fp16", "flash-attention2"]
+                dtype_options = ["bfloat16", "float16"]
 
         return {
             "required": {
@@ -118,9 +95,9 @@ class NunchakuFluxDiTLoader:
                     {
                         "default": attention_options[0],
                         "tooltip": (
-                            "Attention implementation. The default implementation is `flash-attention2`. "
-                            "`nunchaku-fp16` use FP16 attention, offering ~1.2× speedup. "
-                            "Note that 20-series GPUs can only use `nunchaku-fp16`."
+                            "Attention implementation. "
+                            "On XPU, PyTorch SDPA is used. "
+                            "On CUDA, `flash-attention2` or `nunchaku-fp16` are available."
                         ),
                     },
                 ),
@@ -180,44 +157,18 @@ class NunchakuFluxDiTLoader:
         data_type: str,
         **kwargs,
     ):
-        """
-        Load a Nunchaku FLUX model with the specified configuration.
-
-        Parameters
-        ----------
-        model_path : str
-            Path to the model directory or safetensors file.
-        attention : str
-            Attention implementation to use ("nunchaku-fp16" or "flash-attention2").
-        cache_threshold : float
-            Caching tolerance for first-block cache. See :ref:`nunchaku:usage-fbcache` for details.
-        cpu_offload : str
-            Whether to enable CPU offload ("auto", "enable", "disable").
-        device_id : int
-            GPU device ID to use.
-        data_type : str
-            Data type for inference ("bfloat16" or "float16").
-        **kwargs
-            Additional keyword arguments.
-
-        Returns
-        -------
-        tuple
-            A tuple containing the loaded and patched model.
-        """
-        device = torch.device(f"cuda:{device_id}")
+        device = get_device(device_id)
 
         model_path = get_full_path_or_raise("diffusion_models", model_path)
 
         # Check if the device_id is valid
-        if device_id >= torch.cuda.device_count():
-            raise ValueError(f"Invalid device_id: {device_id}. Only {torch.cuda.device_count()} GPUs available.")
+        if device_id >= get_device_count():
+            raise ValueError(f"Invalid device_id: {device_id}. Only {get_device_count()} devices available.")
 
         # Get the GPU properties
-        gpu_properties = torch.cuda.get_device_properties(device_id)
-        gpu_memory = gpu_properties.total_memory / (1024**2)  # Convert to MiB
-        gpu_name = gpu_properties.name
-        logger.debug(f"GPU {device_id} ({gpu_name}) Memory: {gpu_memory} MiB")
+        gpu_memory = get_gpu_memory(device, unit="MiB")
+        gpu_name = get_device_name(device_id)
+        logger.debug(f"Device {device_id} ({gpu_name}) Memory: {gpu_memory} MiB")
 
         # Check if CPU offload needs to be enabled
         if cpu_offload == "auto":
@@ -251,7 +202,7 @@ class NunchakuFluxDiTLoader:
                 comfy.model_management.soft_empty_cache()
                 comfy.model_management.free_memory(model_size, device)
 
-            self.transformer, self.metadata = NunchakuFluxTransformer2dModel.from_pretrained(
+            self.transformer, self.metadata = FluxTransformerModel.from_pretrained(
                 model_path,
                 offload=cpu_offload_enabled,
                 device=device,
@@ -262,11 +213,16 @@ class NunchakuFluxDiTLoader:
             self.device = device
             self.cpu_offload = cpu_offload_enabled
             self.data_type = data_type
-        self.transformer = apply_cache_on_transformer(
-            transformer=self.transformer, residual_diff_threshold=cache_threshold
-        )
+
+        if not is_xpu():
+            self.transformer = apply_cache_on_transformer(
+                transformer=self.transformer, residual_diff_threshold=cache_threshold
+            )
+
         transformer = self.transformer
-        if attention == "nunchaku-fp16":
+        if is_xpu():
+            transformer.set_attention_impl("sdpa")
+        elif attention == "nunchaku-fp16":
             transformer.set_attention_impl("nunchaku-fp16")
         else:
             assert attention == "flash-attention2"

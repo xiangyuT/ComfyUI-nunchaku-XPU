@@ -12,10 +12,40 @@ from comfy.model_patcher import ModelPatcher
 from einops import rearrange, repeat
 from torch import nn
 
-from nunchaku import NunchakuFluxTransformer2dModel
-from nunchaku.caching.fbcache import cache_context, create_cache_context
-from nunchaku.lora.flux.compose import compose_lora
-from nunchaku.utils import load_state_dict_in_safetensors
+from ..xpu_backend import is_xpu
+
+if is_xpu():
+    from ..xpu_backend.flux_transformer import XPUFluxTransformer2dModel as NunchakuFluxTransformer2dModel
+
+    # Stub implementations for XPU
+    def cache_context(ctx):
+        import contextlib
+        return contextlib.nullcontext()
+
+    def create_cache_context():
+        return None
+
+    def compose_lora(lora_list):
+        """Compose LoRA weights (simplified for XPU)."""
+        if not lora_list:
+            return {}
+        composed = {}
+        for sd, strength in lora_list:
+            for k, v in sd.items():
+                if k in composed:
+                    composed[k] = composed[k] + v * strength
+                else:
+                    composed[k] = v * strength
+        return composed
+
+    def load_state_dict_in_safetensors(path):
+        from safetensors.torch import load_file
+        return load_file(path)
+else:
+    from nunchaku import NunchakuFluxTransformer2dModel
+    from nunchaku.caching.fbcache import cache_context, create_cache_context
+    from nunchaku.lora.flux.compose import compose_lora
+    from nunchaku.utils import load_state_dict_in_safetensors
 
 
 class ComfyFluxWrapper(nn.Module):

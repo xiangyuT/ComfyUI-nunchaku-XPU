@@ -18,10 +18,30 @@ import torch.nn.functional as F
 from comfy.ldm.lumina.model import FeedForward, JointAttention, JointTransformerBlock, NextDiT, clamp_fp16
 from comfy.ldm.modules.attention import optimized_attention_masked
 
-from nunchaku.models.embeddings import pack_rotemb
-from nunchaku.models.linear import SVDQW4A4Linear
-from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
-from nunchaku.utils import pad_tensor
+from ..xpu_backend import is_xpu
+
+if is_xpu():
+    from ..xpu_backend.linear import SVDQW4A4Linear
+    from ..xpu_backend.ops import svdq_gemm_w4a4 as svdq_gemm_w4a4_cuda
+
+    def pack_rotemb(freqs_cis):
+        """XPU-compatible pack_rotemb: just return the tensor as-is."""
+        return freqs_cis
+
+    def pad_tensor(x, multiple, dim):
+        """Pad tensor along dim to be a multiple of `multiple`."""
+        size = x.shape[dim]
+        if size % multiple == 0:
+            return x
+        pad_size = multiple - (size % multiple)
+        padding = [0] * (2 * x.ndim)
+        padding[2 * (x.ndim - 1 - dim) + 1] = pad_size
+        return F.pad(x, padding)
+else:
+    from nunchaku.models.embeddings import pack_rotemb
+    from nunchaku.models.linear import SVDQW4A4Linear
+    from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
+    from nunchaku.utils import pad_tensor
 
 
 def add_comfy_cast_weights_attr(svdq_linear: SVDQW4A4Linear, comfy_linear: nn.Linear):

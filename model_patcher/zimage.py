@@ -15,8 +15,21 @@ from comfy.model_patcher import LowVramPatch, ModelPatcher, get_key_weight, move
 from comfy.utils import get_attr, set_attr_param
 from comfy.weight_adapter.lora import LoRAAdapter
 
-from nunchaku.lora.flux.nunchaku_converter import pack_lowrank_weight, unpack_lowrank_weight
-from nunchaku.models.linear import SVDQW4A4Linear
+from ..xpu_backend import is_xpu
+
+if is_xpu():
+    from ..xpu_backend.linear import SVDQW4A4Linear
+
+    def pack_lowrank_weight(weight, down=True):
+        """Pack LoRA weight (identity on XPU - no special packing needed)."""
+        return weight
+
+    def unpack_lowrank_weight(weight, down=True):
+        """Unpack LoRA weight (identity on XPU)."""
+        return weight
+else:
+    from nunchaku.lora.flux.nunchaku_converter import pack_lowrank_weight, unpack_lowrank_weight
+    from nunchaku.models.linear import SVDQW4A4Linear
 
 
 def apply_lora_to_svdq_linear(linear: SVDQW4A4Linear, lora_down: torch.Tensor, lora_up: torch.Tensor):

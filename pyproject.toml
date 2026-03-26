@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 requires = [ "setuptools>=61", "wheel" ]
 
 [project]
-name = "ComfyUI-nunchaku"
-version = "1.2.1"
-description = "Nunchaku ComfyUI Node. Nunchaku is a high-performance inference engine optimized for low-bit neural networks. See more details: https://github.com/nunchaku-tech/nunchaku"
+name = "ComfyUI-nunchaku-XPU"
+version = "1.2.1-xpu.1"
+description = "Nunchaku ComfyUI Node with Intel XPU support. Supports both NVIDIA CUDA (via nunchaku) and Intel XPU (via omni_xpu_kernel) backends."
 license = { file = "LICENCE.txt" }
 requires-python = ">=3.10,<3.14"
-#  Used by Comfy Registry https://comfyregistry.org
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
@@ -31,6 +30,19 @@ dependencies = [
   "sentencepiece",
   "timm",
   "tomli",
+  "safetensors",
+  "einops",
+  "packaging",
+]
+
+# XPU-specific optional dependencies
+optional-dependencies.xpu = [
+  # omni_xpu_kernel should be installed separately from llm-scaler
+  # torch with XPU support should be installed separately
+]
+
+optional-dependencies.cuda = [
+  # Original nunchaku CUDA backend
 ]
 
 optional-dependencies.ci = [
@@ -62,30 +74,12 @@ optional-dependencies.dev = [
   "timm",
   "torchmetrics",
 ]
-optional-dependencies.docs = [
-  "breathe",
-  "furo",
-  "graphviz",
-  "ipykernel",
-  "jupyter",
-  "myst-parser",
-  "nbsphinx",
-  "sphinx",
-  "sphinx-book-theme",
-  "sphinx-copybutton",
-  "sphinx-rtd-theme",
-  "sphinx-tabs",
-  "sphinxawesome-theme",
-  "sphinxcontrib-mermaid",
-  "sphinxext-rediraffe",
-]
 optional-dependencies.torch25 = [ "nunchaku==1.0.1+torch2.5; sys_platform!='darwin'", "torch>=2.5,<2.6" ]
 optional-dependencies.torch26 = [ "nunchaku==1.0.1+torch2.6; sys_platform!='darwin'", "torch>=2.6,<2.7" ]
 optional-dependencies.torch27 = [ "nunchaku==1.0.1+torch2.7; sys_platform!='darwin'", "torch>=2.7,<2.8" ]
 optional-dependencies.torch28 = [ "nunchaku==1.0.1+torch2.8; sys_platform!='darwin'", "torch>=2.8,<2.9" ]
-# when working with pre-release torch, we don't know what the version string will be, so let's omit it
 optional-dependencies.torchpre = [ "nunchaku==1.0.1+torch2.10; sys_platform!='darwin'" ]
-urls.Repository = "https://github.com/nunchaku-tech/ComfyUI-nunchaku"
+urls.Repository = "https://github.com/analytics-zoo/ComfyUI-nunchaku-XPU"
 entry-points."comfyui.custom_nodes".comfyui_nunchaku = "comfyui_nunchaku"
 
 [tool.setuptools]
@@ -102,6 +96,8 @@ packages = [
   "comfyui_nunchaku.nodes.preprocessors",
   "comfyui_nunchaku.nodes.tools",
   "comfyui_nunchaku.wrappers",
+  "comfyui_nunchaku.xpu_backend",
+  "comfyui_nunchaku.model_patcher",
 ]
 
 [tool.setuptools.package-data]
@@ -121,22 +117,13 @@ per-file-ignores."__init__.py" = [ "E402" ]
 
 [tool.isort]
 profile = "black"
-known_first_party = [ "nunchaku" ]
+known_first_party = [ "nunchaku", "omni_xpu_kernel" ]
 line_length = 120
 
 [tool.comfy]
-PublisherId = "lmxyy1999"
-DisplayName = "ComfyUI-nunchaku"
+PublisherId = "analytics-zoo"
+DisplayName = "ComfyUI-nunchaku-XPU"
 Icon = "https://raw.githubusercontent.com/nunchaku-tech/nunchaku/96615bd93a1f0d2cf98039fddecfec43ce34cc96/assets/nunchaku.svg"
-
-[tool.doc8]
-max-line-length = 120
-ignore-path = [ "docs/_build" ]
-ignore = [ "D000", "D001" ]
-
-[tool.rstcheck]
-ignore_directives = [ "tabs" ]
-ignore_messages = [ "ERROR/3", "INFO/1" ]
 
 [tool.uv]
 conflicts = [

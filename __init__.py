@@ -6,6 +6,9 @@ import torch
 import yaml
 from packaging.version import InvalidVersion, Version
 
+from .xpu_backend import get_backend, is_xpu
+from .xpu_backend.device import get_precision
+
 # vanilla and LTS compatibility snippet
 try:
     from comfy_compatibility.vanilla import prepare_vanilla_environment
@@ -15,9 +18,7 @@ try:
     from comfy.model_downloader import add_known_models
     from comfy.model_downloader_types import HuggingFile
 
-    capability = torch.cuda.get_device_capability(0 if torch.cuda.is_available() else None)
-    sm = f"{capability[0]}{capability[1]}"
-    precision = "fp4" if sm == "120" else "int4"
+    precision = get_precision()
 
     # add known models
 
@@ -50,31 +51,43 @@ log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-logger.info("=" * 40 + " ComfyUI-nunchaku Initialization " + "=" * 40)
+logger.info("=" * 40 + " ComfyUI-nunchaku-XPU Initialization " + "=" * 40)
 
-from .utils import get_package_version, get_plugin_version
+backend = get_backend()
+logger.info(f"Backend: {backend}")
 
-nunchaku_full_version = get_package_version("nunchaku").split("+")[0].strip()
+from .utils import get_plugin_version
 
-logger.info(f"Nunchaku version: {nunchaku_full_version}")
-logger.info(f"ComfyUI-nunchaku version: {get_plugin_version()}")
+if is_xpu():
+    try:
+        import omni_xpu_kernel
+        logger.info(f"omni_xpu_kernel version: {omni_xpu_kernel.__version__}")
+    except ImportError:
+        logger.warning("omni_xpu_kernel not found - XPU kernel acceleration unavailable")
+    nunchaku_version_str = "XPU-backend"
+else:
+    from .utils import get_package_version
+    nunchaku_full_version = get_package_version("nunchaku").split("+")[0].strip()
+    nunchaku_version_str = nunchaku_full_version
+    logger.info(f"Nunchaku version: {nunchaku_full_version}")
 
+    min_nunchaku_version = "1.0.0"
+    nunchaku_version = nunchaku_full_version.split("+")[0].strip()
+    nunchaku_major_minor_patch_version = ".".join(nunchaku_version.split(".")[:3])
 
-min_nunchaku_version = "1.0.0"
-nunchaku_version = nunchaku_full_version.split("+")[0].strip()
-nunchaku_major_minor_patch_version = ".".join(nunchaku_version.split(".")[:3])
-
-try:
-    if Version(nunchaku_major_minor_patch_version) < Version(min_nunchaku_version):
+    try:
+        if Version(nunchaku_major_minor_patch_version) < Version(min_nunchaku_version):
+            logger.warning(
+                f"ComfyUI-nunchaku {get_plugin_version()} requires nunchaku >= v{min_nunchaku_version}, "
+                f"but found nunchaku {nunchaku_full_version}. Please update nunchaku."
+            )
+    except InvalidVersion:
         logger.warning(
-            f"ComfyUI-nunchaku {get_plugin_version()} requires nunchaku >= v{min_nunchaku_version}, "
-            f"but found nunchaku {nunchaku_full_version}. Please update nunchaku."
+            f"Could not parse nunchaku version: {nunchaku_full_version}. "
+            f"Please ensure you have at least v{min_nunchaku_version}."
         )
-except InvalidVersion:
-    logger.warning(
-        f"Could not parse nunchaku version: {nunchaku_full_version}. "
-        f"Please ensure you have at least v{min_nunchaku_version}."
-    )
+
+logger.info(f"ComfyUI-nunchaku-XPU version: {get_plugin_version()}")
 
 NODE_CLASS_MAPPINGS = {}
 
@@ -163,4 +176,4 @@ except ImportError:
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: v.TITLE for k, v in NODE_CLASS_MAPPINGS.items()}
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-logger.info("=" * (80 + len(" ComfyUI-nunchaku Initialization ")))
+logger.info("=" * (80 + len(" ComfyUI-nunchaku-XPU Initialization ")))

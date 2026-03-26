@@ -11,8 +11,21 @@ import torch
 from diffusers import FluxPipeline
 from torchvision import transforms
 
-from nunchaku.models.ip_adapter.diffusers_adapters import apply_IPA_on_pipe
-from nunchaku.models.ip_adapter.utils import undo_all_mods_on_transformer
+from ...xpu_backend import is_xpu
+
+if is_xpu():
+    import logging as _logging
+    _ipa_logger = _logging.getLogger(__name__)
+
+    def apply_IPA_on_pipe(*args, **kwargs):
+        _ipa_logger.warning("IP-Adapter is not yet supported on Intel XPU")
+        return None
+
+    def undo_all_mods_on_transformer(*args, **kwargs):
+        pass
+else:
+    from nunchaku.models.ip_adapter.diffusers_adapters import apply_IPA_on_pipe
+    from nunchaku.models.ip_adapter.utils import undo_all_mods_on_transformer
 
 from .utils import set_extra_config_model_path
 

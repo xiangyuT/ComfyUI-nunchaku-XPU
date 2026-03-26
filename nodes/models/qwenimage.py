@@ -10,7 +10,7 @@ import comfy.utils
 import torch
 from comfy import model_detection, model_management
 
-from nunchaku.utils import check_hardware_compatibility, get_gpu_memory, get_precision_from_quantization_config
+from ...xpu_backend.device import check_hardware_compatibility, get_gpu_memory, get_precision_from_quantization_config
 
 from ...model_configs.qwenimage import NunchakuQwenImage
 from ...model_patcher.common import NunchakuModelPatcher

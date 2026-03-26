@@ -6,7 +6,15 @@ for applying LoRA weights to Nunchaku FLUX models within ComfyUI.
 import logging
 import os
 
-from nunchaku.lora.flux import to_diffusers
+from ...xpu_backend import is_xpu
+
+if is_xpu():
+    def to_diffusers(path):
+        """Load LoRA state dict (simplified for XPU)."""
+        from safetensors.torch import load_file
+        return load_file(path)
+else:
+    from nunchaku.lora.flux import to_diffusers
 
 from ...wrappers.flux import ComfyFluxWrapper, copy_with_ctx
 from ..utils import get_filename_list, get_full_path_or_raise

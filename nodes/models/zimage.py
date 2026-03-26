@@ -9,8 +9,19 @@ import comfy.utils
 import torch
 from comfy import model_detection, model_management
 
-from nunchaku.models.transformers.utils import convert_fp16, patch_scale_key
-from nunchaku.utils import check_hardware_compatibility, get_precision_from_quantization_config, is_turing
+from ...xpu_backend import is_xpu
+from ...xpu_backend.device import check_hardware_compatibility, get_precision_from_quantization_config, is_turing
+
+if is_xpu():
+    def convert_fp16(model, state_dict):
+        """On XPU, no special FP16 conversion needed."""
+        pass
+
+    def patch_scale_key(model, state_dict):
+        """On XPU, no special scale key patching needed."""
+        pass
+else:
+    from nunchaku.models.transformers.utils import convert_fp16, patch_scale_key
 
 from ...model_configs.zimage import NunchakuZImage
 from ...model_patcher.zimage import ZImageModelPatcher

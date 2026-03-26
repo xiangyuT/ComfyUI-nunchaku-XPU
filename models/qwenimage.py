@@ -27,9 +27,17 @@ from comfy.ldm.qwen_image.model import (
 )
 from torch import nn
 
-from nunchaku.models.linear import AWQW4A16Linear, SVDQW4A4Linear
-from nunchaku.models.utils import CPUOffloadManager
-from nunchaku.ops.fused import fused_gelu_mlp
+from ..xpu_backend import is_xpu
+from ..xpu_backend.device import current_stream, empty_cache, stream_context
+
+if is_xpu():
+    from ..xpu_backend.linear import AWQW4A16Linear, SVDQW4A4Linear
+    from ..xpu_backend.offload import CPUOffloadManager
+    from ..xpu_backend.ops import fused_gelu_mlp
+else:
+    from nunchaku.models.linear import AWQW4A16Linear, SVDQW4A4Linear
+    from nunchaku.models.utils import CPUOffloadManager
+    from nunchaku.ops.fused import fused_gelu_mlp
 
 from ..mixins.model import NunchakuModelMixin
 
@@ -741,12 +749,12 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
         blocks_replace = patches_replace.get("dit", {})
 
         # Setup compute stream for offloading
-        compute_stream = torch.cuda.current_stream()
+        compute_stream = current_stream()
         if self.offload:
             self.offload_manager.initialize(compute_stream)
 
         for i, block in enumerate(self.transformer_blocks):
-            with torch.cuda.stream(compute_stream):
+            with stream_context(compute_stream):
                 if self.offload:
                     block = self.offload_manager.get_block(i)
                 if ("double_block", i) in blocks_replace:
@@ -855,4 +863,4 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
         else:
             self.offload_manager = None
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache()

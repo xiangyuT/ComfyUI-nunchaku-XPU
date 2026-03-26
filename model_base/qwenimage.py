@@ -7,7 +7,12 @@ This module provides a wrapper for ComfyUI's Qwen-Image model base.
 import torch
 from comfy.model_base import ModelType, QwenImage
 
-from nunchaku.models.linear import SVDQW4A4Linear
+from ..xpu_backend import is_xpu
+
+if is_xpu():
+    from ..xpu_backend.linear import SVDQW4A4Linear
+else:
+    from nunchaku.models.linear import SVDQW4A4Linear
 
 from ..models.qwenimage import NunchakuQwenImageTransformer2DModel
 
