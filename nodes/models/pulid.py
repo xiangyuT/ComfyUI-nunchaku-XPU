@@ -16,27 +16,13 @@ import comfy
 import numpy as np
 import torch
 
-from ...xpu_backend import is_xpu
-
-if is_xpu():
-    # PuLID requires nunchaku's CUDA pipeline - provide stubs on XPU
-    import logging as _logging
-    _pulid_logger = _logging.getLogger(__name__)
-
-    class PuLIDPipeline:
-        """Stub PuLID pipeline for XPU (not yet supported)."""
-        def __init__(self, *args, **kwargs):
-            _pulid_logger.warning("PuLID is not yet supported on Intel XPU")
-        def get_id_embedding(self, image):
-            return None, None
-        def load_pretrain(self, path):
-            pass
-
-    def pulid_forward(*args, **kwargs):
-        raise NotImplementedError("PuLID forward is not yet supported on Intel XPU")
-else:
-    from nunchaku.models.pulid.pulid_forward import pulid_forward
-    from nunchaku.pipeline.pipeline_flux_pulid import PuLIDPipeline
+import logging as _logging
+_pulid_logger = _logging.getLogger(__name__)
+class PuLIDPipeline:
+    def __init__(self, *args, **kwargs): _pulid_logger.warning("PuLID not yet supported")
+    def get_id_embedding(self, image): return None, None
+    def load_pretrain(self, path): pass
+def pulid_forward(*args, **kwargs): raise NotImplementedError("PuLID not supported")
 
 from ...wrappers.flux import ComfyFluxWrapper, copy_with_ctx
 from ..utils import folder_paths, get_filename_list, get_full_path_or_raise
@@ -269,8 +255,8 @@ class NunchakuPulidApply:
     """
 
     def __init__(self):
-        from ...xpu_backend.device import get_torch_device
-        self.pulid_device = str(get_torch_device())
+        from nunchaku_torch.device import resolve_device
+        self.pulid_device = str(resolve_device("auto"))
         self.weight_dtype = torch.bfloat16
         self.onnx_provider = "gpu"
         self.pretrained_model = None
@@ -365,8 +351,8 @@ class NunchakuPulidLoader:
         """
         Initialize the loader with default device, dtype, and ONNX provider.
         """
-        from ...xpu_backend.device import get_torch_device
-        self.pulid_device = str(get_torch_device())
+        from nunchaku_torch.device import resolve_device
+        self.pulid_device = str(resolve_device("auto"))
         self.weight_dtype = torch.bfloat16
         self.onnx_provider = "gpu"
         self.pretrained_model = None

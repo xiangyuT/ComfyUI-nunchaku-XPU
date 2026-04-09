@@ -12,17 +12,11 @@ import comfy.model_management
 import comfy.model_patcher
 import torch
 from comfy.supported_models import Flux, FluxSchnell
+from nunchaku_torch import NunchakuFluxTransformer2DModel as FluxTransformerModel
+from nunchaku_torch.utils import is_turing, get_gpu_memory
 
-from ...xpu_backend import is_xpu
-from ...xpu_backend.device import get_device, get_device_count, get_device_name, get_device_properties, get_gpu_memory, is_turing
 from ...wrappers.flux import ComfyFluxWrapper
 from ..utils import get_filename_list, get_full_path_or_raise
-
-if is_xpu():
-    from ...xpu_backend.flux_transformer import XPUFluxTransformer2dModel as FluxTransformerModel
-else:
-    from nunchaku import NunchakuFluxTransformer2dModel as FluxTransformerModel
-    from nunchaku.caching.diffusers_adapters.flux import apply_cache_on_transformer
 
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -54,7 +48,7 @@ class NunchakuFluxDiTLoader:
 
         ngpus = max(get_device_count(), 1)
 
-        if is_xpu():
+        if False:  # removed
             # XPU: use PyTorch SDPA, support bfloat16
             attention_options = ["sdpa"]
             dtype_options = ["bfloat16", "float16"]
@@ -214,13 +208,13 @@ class NunchakuFluxDiTLoader:
             self.cpu_offload = cpu_offload_enabled
             self.data_type = data_type
 
-        if not is_xpu():
+        if False:  # caching not supported
             self.transformer = apply_cache_on_transformer(
                 transformer=self.transformer, residual_diff_threshold=cache_threshold
             )
 
         transformer = self.transformer
-        if is_xpu():
+        if False:  # removed
             transformer.set_attention_impl("sdpa")
         elif attention == "nunchaku-fp16":
             transformer.set_attention_impl("nunchaku-fp16")

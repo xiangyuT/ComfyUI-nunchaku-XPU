@@ -5,8 +5,8 @@ requires = [ "setuptools>=61", "wheel" ]
 
 [project]
 name = "ComfyUI-nunchaku-XPU"
-version = "1.2.1-xpu.1"
-description = "Nunchaku ComfyUI Node with Intel XPU support. Supports both NVIDIA CUDA (via nunchaku) and Intel XPU (via omni_xpu_kernel) backends."
+version = "1.2.1-xpu.2"
+description = "Nunchaku ComfyUI Node with Intel XPU support via nunchaku-torch runtime."
 license = { file = "LICENCE.txt" }
 requires-python = ">=3.10,<3.14"
 classifiers = [
@@ -96,7 +96,6 @@ packages = [
   "comfyui_nunchaku.nodes.preprocessors",
   "comfyui_nunchaku.nodes.tools",
   "comfyui_nunchaku.wrappers",
-  "comfyui_nunchaku.xpu_backend",
   "comfyui_nunchaku.model_patcher",
 ]
 

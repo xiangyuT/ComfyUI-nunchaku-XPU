@@ -27,17 +27,31 @@ from comfy.ldm.qwen_image.model import (
 )
 from torch import nn
 
-from ..xpu_backend import is_xpu
-from ..xpu_backend.device import current_stream, empty_cache, stream_context
+from nunchaku_torch.models.linear import AWQW4A16Linear, SVDQW4A4Linear
+from nunchaku_torch.models.utils import CPUOffloadManager
+from nunchaku_torch.ops.fused import fused_gelu_mlp
+from nunchaku_torch.device import has_xpu
 
-if is_xpu():
-    from ..xpu_backend.linear import AWQW4A16Linear, SVDQW4A4Linear
-    from ..xpu_backend.offload import CPUOffloadManager
-    from ..xpu_backend.ops import fused_gelu_mlp
-else:
-    from nunchaku.models.linear import AWQW4A16Linear, SVDQW4A4Linear
-    from nunchaku.models.utils import CPUOffloadManager
-    from nunchaku.ops.fused import fused_gelu_mlp
+def current_stream(device=None):
+    if has_xpu():
+        import torch
+        return torch.xpu.current_stream(device)
+    return None
+
+def empty_cache():
+    import torch
+    if has_xpu():
+        torch.xpu.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def stream_context(stream):
+    import torch, contextlib
+    if stream is None:
+        return contextlib.nullcontext()
+    if has_xpu():
+        return torch.xpu.stream(stream)
+    return torch.cuda.stream(stream)
 
 from ..mixins.model import NunchakuModelMixin
 

@@ -9,19 +9,12 @@ import comfy.utils
 import torch
 from comfy import model_detection, model_management
 
-from ...xpu_backend import is_xpu
-from ...xpu_backend.device import check_hardware_compatibility, get_precision_from_quantization_config, is_turing
 
-if is_xpu():
-    def convert_fp16(model, state_dict):
-        """On XPU, no special FP16 conversion needed."""
-        pass
+from nunchaku_torch.utils import check_hardware_compatibility, get_precision, is_turing
+from nunchaku_torch.models.transformers.utils import convert_fp16, patch_scale_key
 
-    def patch_scale_key(model, state_dict):
-        """On XPU, no special scale key patching needed."""
-        pass
-else:
-    from nunchaku.models.transformers.utils import convert_fp16, patch_scale_key
+def get_precision_from_quantization_config(qc):
+    return qc.get("quant_type", "int4")
 
 from ...model_configs.zimage import NunchakuZImage
 from ...model_patcher.zimage import ZImageModelPatcher

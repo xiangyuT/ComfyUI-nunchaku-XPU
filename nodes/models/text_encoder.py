@@ -15,19 +15,23 @@ import torch
 from comfy.text_encoders.flux import FluxClipModel
 from torch import nn
 
-from ...xpu_backend import is_xpu
-from ...xpu_backend.device import empty_cache, get_torch_device
+from nunchaku_torch.device import has_xpu, resolve_device
+def get_torch_device(): return resolve_device("auto")
+def empty_cache():
+    import torch
+    if has_xpu(): torch.xpu.empty_cache()
+    elif torch.cuda.is_available(): torch.cuda.empty_cache()
 
-if is_xpu():
+if has_xpu():
     # On XPU, T5 encoder runs in standard PyTorch mode (no nunchaku C++ kernels)
     # We still import NunchakuT5EncoderModel for compatibility but it will use
     # standard PyTorch ops on XPU
     try:
-        from nunchaku import NunchakuT5EncoderModel
+        NunchakuT5EncoderModel = None  # Not yet in nunchaku_torch
     except ImportError:
         NunchakuT5EncoderModel = None
 else:
-    from nunchaku import NunchakuT5EncoderModel
+    NunchakuT5EncoderModel = None  # Not yet in nunchaku_torch
 
 from ..utils import folder_paths, get_filename_list, get_full_path_or_raise
 

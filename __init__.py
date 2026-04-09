@@ -6,8 +6,8 @@ import torch
 import yaml
 from packaging.version import InvalidVersion, Version
 
-from .xpu_backend import get_backend, is_xpu
-from .xpu_backend.device import get_precision
+from nunchaku_torch.device import has_xpu
+from nunchaku_torch.utils import get_precision
 
 # vanilla and LTS compatibility snippet
 try:
@@ -53,39 +53,15 @@ logger = logging.getLogger(__name__)
 
 logger.info("=" * 40 + " ComfyUI-nunchaku-XPU Initialization " + "=" * 40)
 
-backend = get_backend()
-logger.info(f"Backend: {backend}")
+logger.info(f"XPU available: {has_xpu()}")
 
 from .utils import get_plugin_version
 
-if is_xpu():
-    try:
-        import omni_xpu_kernel
-        logger.info(f"omni_xpu_kernel version: {omni_xpu_kernel.__version__}")
-    except ImportError:
-        logger.warning("omni_xpu_kernel not found - XPU kernel acceleration unavailable")
-    nunchaku_version_str = "XPU-backend"
-else:
-    from .utils import get_package_version
-    nunchaku_full_version = get_package_version("nunchaku").split("+")[0].strip()
-    nunchaku_version_str = nunchaku_full_version
-    logger.info(f"Nunchaku version: {nunchaku_full_version}")
-
-    min_nunchaku_version = "1.0.0"
-    nunchaku_version = nunchaku_full_version.split("+")[0].strip()
-    nunchaku_major_minor_patch_version = ".".join(nunchaku_version.split(".")[:3])
-
-    try:
-        if Version(nunchaku_major_minor_patch_version) < Version(min_nunchaku_version):
-            logger.warning(
-                f"ComfyUI-nunchaku {get_plugin_version()} requires nunchaku >= v{min_nunchaku_version}, "
-                f"but found nunchaku {nunchaku_full_version}. Please update nunchaku."
-            )
-    except InvalidVersion:
-        logger.warning(
-            f"Could not parse nunchaku version: {nunchaku_full_version}. "
-            f"Please ensure you have at least v{min_nunchaku_version}."
-        )
+try:
+    import nunchaku_torch
+    logger.info(f"nunchaku_torch version: {nunchaku_torch.__version__}")
+except ImportError:
+    logger.warning("nunchaku_torch not found - install from analytics-zoo/nunchaku-torch")
 
 logger.info(f"ComfyUI-nunchaku-XPU version: {get_plugin_version()}")
 

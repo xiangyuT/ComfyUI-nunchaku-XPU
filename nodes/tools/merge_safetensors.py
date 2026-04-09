@@ -7,33 +7,20 @@ from pathlib import Path
 
 from safetensors.torch import save_file
 
-from ...xpu_backend import is_xpu
-
-if is_xpu():
-    def merge_safetensors(pretrained_model_name_or_path, comfy_config_path=None):
-        """Merge safetensors from a model directory (simplified for XPU)."""
-        from pathlib import Path
-        from safetensors.torch import load_file
-        import json
-
-        model_path = Path(pretrained_model_name_or_path)
-        state_dict = {}
-        metadata = {}
-
-        for f in sorted(model_path.glob("*.safetensors")):
-            sd = load_file(str(f))
-            state_dict.update(sd)
-
-        config_path = model_path / "comfy_config.json"
-        if not config_path.exists() and comfy_config_path is not None:
-            config_path = Path(comfy_config_path)
-        if config_path.exists():
-            with open(config_path) as f:
-                metadata["comfy_config"] = f.read()
-
-        return state_dict, metadata
-else:
-    from nunchaku.merge_safetensors import merge_safetensors
+def merge_safetensors(pretrained_model_name_or_path, comfy_config_path=None):
+    from pathlib import Path
+    from safetensors.torch import load_file
+    import json
+    model_path = Path(pretrained_model_name_or_path)
+    state_dict, metadata = {}, {}
+    for f in sorted(model_path.glob("*.safetensors")):
+        state_dict.update(load_file(str(f)))
+    config_path = model_path / "comfy_config.json"
+    if not config_path.exists() and comfy_config_path is not None:
+        config_path = Path(comfy_config_path)
+    if config_path.exists():
+        with open(config_path) as f: metadata["comfy_config"] = f.read()
+    return state_dict, metadata
 
 from ..utils import folder_paths
 
