@@ -72,6 +72,28 @@ def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, 
     return svdq_linear
 
 
+def _rms_norm(x, weight, eps=1e-6):
+    """RMSNorm for Q/K after QKV projection."""
+    variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    out = x * torch.rsqrt(variance + eps)
+    return (out.to(weight.dtype) * weight).to(x.dtype)
+
+
+def _apply_rotary(xq, freqs_cis):
+    """Apply rotary embeddings using ComfyUI's 2x2 rotation matrix format.
+
+    freqs_cis: [1, seq, head_dim/2, 2, 2] rotation matrices
+    xq: [B, seq, heads, head_dim]
+    """
+    B, S, H, D = xq.shape
+    # xq: [B, seq, heads, head_dim] -> [B, seq, heads, head_dim/2, 1, 2]
+    xq_ = xq.float().reshape(B, S, H, D // 2, 1, 2)
+    # freqs_cis: [1, seq, 1, head_dim/2, 2, 2] — already has heads=1 for broadcast
+    # Matrix multiply: out[..., i] = freqs[..., i, 0] * xq[..., 0] + freqs[..., i, 1] * xq[..., 1]
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    return xq_out.reshape(B, S, H, D).type_as(xq)
+
+
 def fused_qkv_norm_rotary(
     x: torch.Tensor,
     qkv: SVDQW4A4Linear,
@@ -82,36 +104,56 @@ def fused_qkv_norm_rotary(
     """
     Fused quantized QKV projection with RMSNorm and rotary embeddings.
 
-    Adapted from nunchaku.ops.fused#fused_qkv_norm_rottary.
-
-    Manual cast `q_norm` weight and `k_norm` weight from `torch.bfloat16` to `torch.float16` when `x` dtype is `torch.float16`.
+    On XPU: decompose into GEMM (via _forward_xpu) + manual norm + rotary,
+    because XPU ops don't support fused norm_q/norm_k/rotary_emb in GEMM.
+    On CUDA: use fused GEMM with norm+rotary in one kernel call.
     """
     batch_size, seq_len, channels = x.shape
+
+    # XPU/CPU: decomposed path (GEMM first, then norm+rotary separately)
+    if x.device.type in ("xpu", "cpu") or qkv.qweight.device.type == "xpu":
+        # QKV projection via SVDQW4A4Linear.forward (auto-dispatches to _forward_xpu)
+        output = qkv(x.view(1, batch_size * seq_len, channels))
+        output = output.view(batch_size, seq_len, -1)
+
+        # Split Q, K, V
+        query, key, value = output.chunk(3, dim=-1)
+        head_dim = int(q_norm_weight.numel()) if q_norm_weight is not None else query.shape[-1]
+        heads = query.shape[-1] // head_dim
+
+        query = query.view(batch_size, seq_len, heads, head_dim)
+        key = key.view(batch_size, seq_len, heads, head_dim)
+
+        # RMSNorm on Q and K
+        if q_norm_weight is not None:
+            query = _rms_norm(query, q_norm_weight)
+        if k_norm_weight is not None:
+            key = _rms_norm(key, k_norm_weight)
+
+        # Rotary embeddings
+        if freqs_cis is not None:
+            query = _apply_rotary(query, freqs_cis)
+            key = _apply_rotary(key, freqs_cis)
+
+        output = torch.cat(
+            [query.flatten(2, 3), key.flatten(2, 3), value.view(batch_size, seq_len, -1)], dim=-1
+        )
+        return output
+
+    # CUDA: fused path
     x_dtype = x.dtype
     x = x.view(batch_size * seq_len, channels)
     quantized_x, ascales, lora_act = qkv.quantize(x)
     output = torch.empty(batch_size * seq_len, qkv.out_features, dtype=x.dtype, device=x.device)
     if (q_norm_weight is not None) and (x_dtype != q_norm_weight.dtype):
-        assert x_dtype == torch.float16
-        assert q_norm_weight.dtype == torch.bfloat16
-        assert k_norm_weight.dtype == torch.bfloat16
         q_norm_weight = torch.nan_to_num(q_norm_weight.to(dtype=torch.float16), nan=0.0, posinf=65504, neginf=-65504)
         k_norm_weight = torch.nan_to_num(k_norm_weight.to(dtype=torch.float16), nan=0.0, posinf=65504, neginf=-65504)
     svdq_gemm_w4a4_cuda(
-        act=quantized_x,
-        wgt=qkv.qweight,
-        out=output,
-        ascales=ascales,
-        wscales=qkv.wscales,
-        lora_act_in=lora_act,
-        lora_up=qkv.proj_up,
-        bias=qkv.bias,
-        fp4=qkv.precision == "nvfp4",
-        alpha=qkv.wtscale,
-        wcscales=qkv.wcscales,
-        norm_q=q_norm_weight if q_norm_weight is not None else None,
-        norm_k=k_norm_weight if k_norm_weight is not None else None,
-        rotary_emb=freqs_cis,
+        act=quantized_x, wgt=qkv.qweight, out=output,
+        ascales=ascales, wscales=qkv.wscales,
+        lora_act_in=lora_act, lora_up=qkv.proj_up, bias=qkv.bias,
+        fp4=qkv.precision == "nvfp4", alpha=qkv.wtscale, wcscales=qkv.wcscales,
+        norm_q=q_norm_weight, norm_k=k_norm_weight, rotary_emb=freqs_cis,
     )
     output = output.view(batch_size, seq_len, -1)
     return output
@@ -321,7 +363,11 @@ def patch_model(diffusion_model: NextDiT, skip_refiners: bool, **kwargs):
     if not skip_refiners:
         _patch_transformer_block(diffusion_model.noise_refiner)
         _patch_transformer_block(diffusion_model.context_refiner)
-    RopeFuseTransformerHook(skip_refiners).hook(diffusion_model)
+    # Only register RopeFuseHook on CUDA (packs freqs_cis for CUDA kernel).
+    # XPU uses decomposed path with complex freqs_cis directly.
+    import comfy.model_management
+    if comfy.model_management.get_torch_device().type == "cuda":
+        RopeFuseTransformerHook(skip_refiners).hook(diffusion_model)
 
     # `norm_final` is not used in Z-Image-Turbo, prevent state dict loading by setting it to None
     # Maybe remove this line in the future if future Z-Image models use `norm_final`

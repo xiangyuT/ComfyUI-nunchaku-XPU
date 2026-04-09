@@ -137,7 +137,7 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
 
     model_config = NunchakuZImage(rank=rank, precision=precision, skip_refiners=skip_refiners)
 
-    if not is_turing():
+    if not is_turing(load_device):
         unet_dtype = torch.bfloat16
         manual_cast_dtype = None
         torch_dtype = torch.bfloat16
