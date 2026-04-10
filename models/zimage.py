@@ -188,32 +188,46 @@ class ComfyNunchakuZImageAttention(JointAttention):
         transformer_options={},
     ) -> torch.Tensor:
         """
-        Adapted from comfy.ldm.lumina.model.JointAttention#forward
-
-        Optimized with fusing qkv projection, q_norm, k_norm and RoPE in one kernel.
+        Uses original ComfyUI JointAttention logic with quantized QKV/out layers.
+        On XPU, uses ComfyUI's native RMSNorm modules and apply_rope instead of
+        manual _rms_norm/_apply_rotary, ensuring identical numerical behavior.
+        On CUDA, uses fused kernel path for performance.
         """
-        logging.debug(f"x shape: {x.shape}, freqs_cis shape: {freqs_cis.shape}")
-        bsz, seqlen, _ = x.shape
-        qkv = fused_qkv_norm_rotary(
-            x,
-            self.qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            freqs_cis,
-        )
-
-        xq, xk, xv = torch.split(
-            qkv,
-            [
-                self.n_local_heads * self.head_dim,
-                self.n_local_kv_heads * self.head_dim,
-                self.n_local_kv_heads * self.head_dim,
-            ],
-            dim=-1,
-        )
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        import comfy.model_management
+        if comfy.model_management.get_torch_device().type == "cuda":
+            # CUDA: use fused kernel path
+            bsz, seqlen, _ = x.shape
+            qkv = fused_qkv_norm_rotary(
+                x, self.qkv, self.q_norm.weight, self.k_norm.weight, freqs_cis,
+            )
+            xq, xk, xv = torch.split(
+                qkv,
+                [self.n_local_heads * self.head_dim,
+                 self.n_local_kv_heads * self.head_dim,
+                 self.n_local_kv_heads * self.head_dim],
+                dim=-1,
+            )
+            xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        else:
+            # XPU/CPU: use original ComfyUI JointAttention logic
+            # (native RMSNorm + apply_rope for numerical correctness)
+            from comfy.ldm.flux.math import apply_rope
+            bsz, seqlen, _ = x.shape
+            xq, xk, xv = torch.split(
+                self.qkv(x),
+                [self.n_local_heads * self.head_dim,
+                 self.n_local_kv_heads * self.head_dim,
+                 self.n_local_kv_heads * self.head_dim],
+                dim=-1,
+            )
+            xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+            xq, xk = apply_rope(xq, xk, freqs_cis)
 
         n_rep = self.n_local_heads // self.n_local_kv_heads
         if n_rep >= 1:

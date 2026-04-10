@@ -149,6 +149,15 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
 
     patched_sd = _patch_state_dict(new_sd)
+
+    # Decode CUDA MMA tile layout to row-major for non-CUDA devices.
+    # Nunchaku checkpoints store qweight/wscales/smooth_factor/proj_up/proj_down
+    # in CUDA tensor-core tile-permuted format. XPU/CPU ops expect sequential layout.
+    if load_device.type != "cuda":
+        from nunchaku_torch.models.transformers.utils import decode_int4_state_dict_for_cpu
+        n_decoded = decode_int4_state_dict_for_cpu(patched_sd)
+        logging.info(f"Decoded {n_decoded} tile-layout weight tensors for non-CUDA device")
+
     model = model_config.get_model(patched_sd, "", torch_dtype=torch_dtype)
 
     patch_scale_key(model.diffusion_model, patched_sd)
