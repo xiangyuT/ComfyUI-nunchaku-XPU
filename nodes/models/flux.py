@@ -18,6 +18,33 @@ from nunchaku_torch.utils import is_turing, get_gpu_memory
 from ...wrappers.flux import ComfyFluxWrapper
 from ..utils import get_filename_list, get_full_path_or_raise
 
+
+def get_device_count():
+    """Get number of available XPU/CUDA devices."""
+    if torch.xpu.is_available():
+        return torch.xpu.device_count()
+    elif torch.cuda.is_available():
+        return torch.cuda.device_count()
+    return 1
+
+
+def get_device(device_id: int = 0):
+    """Get torch device by ID."""
+    if torch.xpu.is_available():
+        return torch.device(f"xpu:{device_id}")
+    elif torch.cuda.is_available():
+        return torch.device(f"cuda:{device_id}")
+    return torch.device("cpu")
+
+
+def get_device_name(device_id: int = 0):
+    """Get device name string."""
+    if torch.xpu.is_available():
+        return torch.xpu.get_device_name(device_id)
+    elif torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+    return "cpu"
+
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -48,9 +75,9 @@ class NunchakuFluxDiTLoader:
 
         ngpus = max(get_device_count(), 1)
 
-        if False:  # removed
-            # XPU: use PyTorch SDPA, support bfloat16
-            attention_options = ["sdpa"]
+        device = comfy.model_management.get_torch_device()
+        if device.type == "xpu":
+            attention_options = ["nunchaku-fp16"]
             dtype_options = ["bfloat16", "float16"]
         else:
             all_turing = True

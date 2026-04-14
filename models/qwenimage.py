@@ -861,8 +861,11 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
             return
         self.offload = offload
         if offload:
+            import comfy.model_management
+            device = kwargs.pop("device", comfy.model_management.get_torch_device())
             self.offload_manager = CPUOffloadManager(
                 self.transformer_blocks,
+                device=device,
                 use_pin_memory=kwargs.get("use_pin_memory", True),
                 on_gpu_modules=[
                     self.img_in,
