@@ -106,6 +106,14 @@ def load_diffusion_model_state_dict(
     model = model_config.get_model(new_sd, "", load_device)
     model = model.to(offload_device)
     model.load_model_weights(new_sd, "")
+
+    # QwenImage needs W4A4 precision on XPU (W4A16 has too much per-layer error)
+    if load_device.type != "cuda":
+        from nunchaku_torch.models.linear import SVDQW4A4Linear
+        for m in model.diffusion_model.modules():
+            if isinstance(m, SVDQW4A4Linear):
+                m._xpu_force_w4a4 = True
+
     return NunchakuModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
 
