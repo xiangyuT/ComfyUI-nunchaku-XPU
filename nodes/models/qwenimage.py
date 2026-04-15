@@ -97,6 +97,12 @@ def load_diffusion_model_state_dict(
     if model_options.get("fp8_optimizations", False):
         model_config.optimizations["fp8"] = True
 
+    # Decode CUDA MMA tile layout to row-major for non-CUDA devices
+    if load_device.type != "cuda":
+        from nunchaku_torch.models.transformers.utils import decode_int4_state_dict_for_cpu
+        n_decoded = decode_int4_state_dict_for_cpu(new_sd)
+        logging.info(f"Decoded {n_decoded} tile-layout weight tensors for non-CUDA device")
+
     model = model_config.get_model(new_sd, "", load_device)
     model = model.to(offload_device)
     model.load_model_weights(new_sd, "")

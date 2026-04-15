@@ -241,28 +241,31 @@ class NunchakuFluxDiTLoader:
             )
 
         transformer = self.transformer
-        if False:  # removed
-            transformer.set_attention_impl("sdpa")
-        elif attention == "nunchaku-fp16":
-            transformer.set_attention_impl("nunchaku-fp16")
-        else:
-            assert attention == "flash-attention2"
-            transformer.set_attention_impl("flashattn2")
+        if hasattr(transformer, "set_attention_impl"):
+            if attention == "nunchaku-fp16":
+                transformer.set_attention_impl("nunchaku-fp16")
+            elif attention == "flash-attention2":
+                transformer.set_attention_impl("flashattn2")
+        # XPU/CPU: attention impl is handled by PyTorch SDPA, no explicit setting needed
 
-        if self.metadata is None:
-            if os.path.exists(os.path.join(model_path, "comfy_config.json")):
-                config_path = os.path.join(model_path, "comfy_config.json")
-            else:
+        has_embedded_config = (
+            self.metadata is not None
+            and isinstance(self.metadata, dict)
+            and "comfy_config" in self.metadata
+        )
+        if has_embedded_config:
+            comfy_config = json.loads(self.metadata["comfy_config"])
+        else:
+            # Look for comfy_config.json: try model directory, then defaults
+            model_dir = os.path.dirname(model_path) if os.path.isfile(model_path) else model_path
+            config_path = os.path.join(model_dir, "comfy_config.json")
+            if not os.path.exists(config_path):
                 default_config_root = os.path.join(os.path.dirname(__file__), "configs")
-                config_name = os.path.basename(model_path).replace("svdq-int4-", "").replace("svdq-fp4-", "")
+                config_name = os.path.basename(model_dir).replace("svdq-int4-", "").replace("svdq-fp4-", "")
                 config_path = os.path.join(default_config_root, f"{config_name}.json")
                 assert os.path.exists(config_path), f"Config file not found: {config_path}"
-
             logger.info(f"Loading ComfyUI model config from {config_path}")
             comfy_config = json.load(open(config_path, "r"))
-        else:
-            comfy_config_str = self.metadata.get("comfy_config", None)
-            comfy_config = json.loads(comfy_config_str)
         model_class_name = comfy_config["model_class"]
 
         model_config = comfy_config["model_config"]
@@ -278,6 +281,8 @@ class NunchakuFluxDiTLoader:
         model_config.set_inference_dtype(torch.bfloat16, None)
         model_config.custom_operations = None
         model = model_config.get_model({})
+        if not hasattr(transformer, "comfy_lora_meta_list"):
+            transformer.comfy_lora_meta_list = []
         model.diffusion_model = ComfyFluxWrapper(
             transformer,
             config=comfy_config["model_config"],
