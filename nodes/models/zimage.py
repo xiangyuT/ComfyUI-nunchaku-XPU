@@ -165,6 +165,14 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
         convert_fp16(model.diffusion_model, patched_sd)
 
     model.load_model_weights(patched_sd, "")
+
+    # Z-Image fits in memory with W4A16 fused GELU MLP (faster than W4A4 default)
+    if load_device.type != "cuda":
+        from nunchaku_torch.models.linear import SVDQW4A4Linear
+        for m in model.diffusion_model.modules():
+            if isinstance(m, SVDQW4A4Linear):
+                m._xpu_use_w4a16_fused = True
+
     return ZImageModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
 
