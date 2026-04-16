@@ -166,12 +166,14 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
 
     model.load_model_weights(patched_sd, "")
 
-    # Z-Image fits in memory with W4A16 fused GELU MLP (faster than W4A4 default)
+    # Force W4A4 for all SVDQ layers on XPU — W4A16 has precision issues
+    # that cause color banding on certain seeds. W4A4 (ESIMD dequant + oneDNN)
+    # matches CPU reference quality at ~1.2ms/layer.
     if load_device.type != "cuda":
         from nunchaku_torch.models.linear import SVDQW4A4Linear
         for m in model.diffusion_model.modules():
             if isinstance(m, SVDQW4A4Linear):
-                m._xpu_use_w4a16_fused = True
+                m._xpu_force_w4a4 = True
 
     return ZImageModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
