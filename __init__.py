@@ -65,6 +65,32 @@ except ImportError:
 
 logger.info(f"ComfyUI-nunchaku-XPU version: {get_plugin_version()}")
 
+# Patch torch.nn.functional.rms_norm with ESIMD kernel on XPU (10x faster)
+try:
+    from omni_xpu_kernel import norm as _omni_norm
+    _torch_rms_norm = torch.nn.functional.rms_norm
+
+    def _patched_rms_norm(input, normalized_shape, weight=None, eps=1e-5):
+        if (input.device.type == "xpu"
+            and weight is not None
+            and input.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and input.shape[-1] == weight.numel()
+            and input.is_contiguous()):
+            try:
+                orig_shape = input.shape
+                x_2d = input.reshape(-1, orig_shape[-1])
+                out = _omni_norm.rms_norm(weight, x_2d, eps)
+                return out.reshape(orig_shape)
+            except Exception:
+                pass
+        return _torch_rms_norm(input, normalized_shape, weight, eps)
+
+    torch.nn.functional.rms_norm = _patched_rms_norm
+    logger.info("Patched rms_norm with ESIMD kernel for XPU")
+except ImportError:
+    pass
+
 NODE_CLASS_MAPPINGS = {}
 
 try:
