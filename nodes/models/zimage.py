@@ -4,6 +4,7 @@ This module provides the :class:`NunchakuZImageDiTLoader` class for loading Nunc
 
 import json
 import logging
+import os
 
 import comfy.utils
 import torch
@@ -166,10 +167,12 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
 
     model.load_model_weights(patched_sd, "")
 
-    # Force W4A4 for all SVDQ layers on XPU — W4A16 has precision issues
-    # that cause color banding on certain seeds. W4A4 (ESIMD dequant + oneDNN)
-    # matches CPU reference quality at ~1.2ms/layer.
-    if load_device.type != "cuda":
+    # Default to the W4A16 fast path on XPU. W4A4 (ESIMD dequant + oneDNN)
+    # matches CPU reference quality and was previously forced to avoid
+    # seed-dependent color banding on W4A16, but we could not reproduce that
+    # banding on current kernels. Opt into W4A4 with NUNCHAKU_XPU_FORCE_W4A4=1
+    # if banding appears.
+    if load_device.type != "cuda" and os.environ.get("NUNCHAKU_XPU_FORCE_W4A4", "0") == "1":
         from nunchaku_torch.models.linear import SVDQW4A4Linear
         for m in model.diffusion_model.modules():
             if isinstance(m, SVDQW4A4Linear):
