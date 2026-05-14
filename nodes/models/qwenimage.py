@@ -107,12 +107,16 @@ def load_diffusion_model_state_dict(
     model = model.to(offload_device)
     model.load_model_weights(new_sd, "")
 
-    # QwenImage needs W4A4 precision on XPU (W4A16 has too much per-layer error)
+    # QwenImage: default to W4A16 fast path for all layers.
+    # Set NUNCHAKU_XPU_FORCE_W4A4=1 to force W4A4 precision path (slower but
+    # bit-exact with CPU reference; use if banding artifacts are observed).
     if load_device.type != "cuda":
-        from nunchaku_torch.models.linear import SVDQW4A4Linear
-        for m in model.diffusion_model.modules():
-            if isinstance(m, SVDQW4A4Linear):
-                m._xpu_force_w4a4 = True
+        import os
+        if os.environ.get("NUNCHAKU_XPU_FORCE_W4A4", "0") == "1":
+            from nunchaku_torch.models.linear import SVDQW4A4Linear
+            for m in model.diffusion_model.modules():
+                if isinstance(m, SVDQW4A4Linear):
+                    m._xpu_force_w4a4 = True
 
     return NunchakuModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
