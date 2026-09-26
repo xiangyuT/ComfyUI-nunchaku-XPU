@@ -1,10 +1,24 @@
 """ComfyUI ModelPatcher clone compatibility for the Z-Image custom node."""
 
+import importlib.util
+from pathlib import Path
+
 import comfy.model_management
 from comfy.model_patcher import ModelPatcher
 import torch
 
-from model_patcher.zimage import ZImageModelPatcher
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+if not (SOURCE_ROOT / "model_patcher" / "zimage.py").is_file():
+    SOURCE_ROOT = Path("/llm/ComfyUI/custom_nodes/ComfyUI-nunchaku-XPU")
+spec = importlib.util.spec_from_file_location(
+    "_nunchaku_zimage_patcher_under_test",
+    SOURCE_ROOT / "model_patcher" / "zimage.py",
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+ZImageModelPatcher = module.ZImageModelPatcher
 
 
 def _patcher(*, fast_disk=False):
