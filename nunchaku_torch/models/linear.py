@@ -6,6 +6,25 @@ from ..ops.gemv import awq_gemv_w4a16_cuda
 from ..ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 
 
+def _resolve_linear_dtype_device(
+    linear: nn.Linear,
+    kwargs: dict,
+) -> tuple[torch.dtype, torch.device | str | None]:
+    weight = linear.weight
+    torch_dtype = kwargs.pop("torch_dtype", None)
+    if torch_dtype is None:
+        if weight is None:
+            raise ValueError(
+                "torch_dtype is required when the source linear weight "
+                "has been pruned"
+            )
+        torch_dtype = weight.dtype
+    device = kwargs.pop("device", None)
+    if device is None and weight is not None:
+        device = weight.device
+    return torch_dtype, device
+
+
 
 class SVDQW4A4Linear(nn.Module):
     def __init__(
@@ -92,8 +111,7 @@ class SVDQW4A4Linear(nn.Module):
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):
         in_features = kwargs.pop("in_features", linear.in_features)
-        torch_dtype = kwargs.pop("torch_dtype", linear.weight.dtype)
-        device = kwargs.pop("device", linear.weight.device)
+        torch_dtype, device = _resolve_linear_dtype_device(linear, kwargs)
         return cls(
             in_features=in_features,
             out_features=linear.out_features,
