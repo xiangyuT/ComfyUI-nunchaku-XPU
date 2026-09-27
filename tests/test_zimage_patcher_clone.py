@@ -4,9 +4,8 @@ import importlib.util
 from pathlib import Path
 
 import comfy.model_management
-from comfy.model_patcher import ModelPatcher
 import torch
-
+from comfy.model_patcher import ModelPatcher
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 if not (SOURCE_ROOT / "model_patcher" / "zimage.py").is_file():
@@ -24,7 +23,10 @@ ZImageModelPatcher = module.ZImageModelPatcher
 def _patcher(*, fast_disk=False):
     device = torch.device("cpu")
     return ZImageModelPatcher(
-        torch.nn.Linear(4, 4), device, device, fast_disk=fast_disk,
+        torch.nn.Linear(4, 4),
+        device,
+        device,
+        fast_disk=fast_disk,
     )
 
 
@@ -47,10 +49,8 @@ def test_clone_accepts_comfyui_fast_disk_and_preserves_backup(monkeypatch):
 def test_constructor_accepts_older_base_without_fast_disk(monkeypatch):
     original_init = ModelPatcher.__init__
 
-    def legacy_init(self, model, load_device, offload_device, size=0,
-                    weight_inplace_update=False):
-        original_init(self, model, load_device, offload_device, size,
-                      weight_inplace_update=weight_inplace_update)
+    def legacy_init(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
+        original_init(self, model, load_device, offload_device, size, weight_inplace_update=weight_inplace_update)
 
     monkeypatch.setattr(ModelPatcher, "__init__", legacy_init)
     patcher = _patcher(fast_disk=True)

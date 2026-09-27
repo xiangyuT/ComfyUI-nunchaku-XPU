@@ -25,7 +25,6 @@ def _resolve_linear_dtype_device(
     return torch_dtype, device
 
 
-
 class SVDQW4A4Linear(nn.Module):
     def __init__(
         self,
