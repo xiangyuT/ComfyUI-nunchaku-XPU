@@ -18,7 +18,10 @@ import torch.nn.functional as F
 from comfy.ldm.lumina.model import FeedForward, JointAttention, JointTransformerBlock, NextDiT, clamp_fp16
 from comfy.ldm.modules.attention import optimized_attention_masked
 
-from nunchaku_torch.models.linear import SVDQW4A4Linear
+from nunchaku_torch.models.linear import (
+    SVDQW4A4Linear,
+    _resolve_linear_dtype_device,
+)
 from nunchaku_torch.ops.gemm import svdq_gemm_w4a4_cuda
 from nunchaku_torch.models.embeddings import pack_rotemb
 from nunchaku_torch.utils import pad_tensor
@@ -59,13 +62,13 @@ def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, 
     """
     assert comfy_linear1.in_features == comfy_linear2.in_features
     assert comfy_linear1.bias is None and comfy_linear2.bias is None
-    torch_dtype = kwargs.pop("torch_dtype", comfy_linear1.weight.dtype)
+    torch_dtype, device = _resolve_linear_dtype_device(comfy_linear1, kwargs)
     svdq_linear = SVDQW4A4Linear(
         comfy_linear1.in_features,
         comfy_linear1.out_features + comfy_linear2.out_features,
         bias=False,
         torch_dtype=torch_dtype,
-        device=comfy_linear1.weight.device,
+        device=device,
         **kwargs,
     )
     add_comfy_cast_weights_attr(svdq_linear, comfy_linear1)

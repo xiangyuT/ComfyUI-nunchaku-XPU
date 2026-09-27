@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import nunchaku_torch.zimage as runtime_zimage
 from nunchaku_torch import GenerationConfig
+from nunchaku_torch.models.linear import SVDQW4A4Linear
 from nunchaku_torch.models.transformers import NunchakuZImageTransformer2DModel
 from nunchaku_torch.models.transformers import transformer_zimage
 
@@ -16,6 +18,29 @@ def test_generation_config_defaults():
     )
     assert config.device == "auto"
     assert config.steps == 9
+
+
+def test_svdq_from_linear_accepts_comfy_pruned_weight_with_explicit_dtype():
+    linear = torch.nn.Linear(16, 32, bias=False)
+    linear.register_parameter("weight", None)
+
+    converted = SVDQW4A4Linear.from_linear(
+        linear,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert converted.in_features == 16
+    assert converted.out_features == 32
+    assert converted.torch_dtype == torch.bfloat16
+    assert converted.qweight.device.type == "cpu"
+
+
+def test_svdq_from_linear_requires_dtype_for_comfy_pruned_weight():
+    linear = torch.nn.Linear(16, 32, bias=False)
+    linear.register_parameter("weight", None)
+
+    with pytest.raises(ValueError, match="torch_dtype is required"):
+        SVDQW4A4Linear.from_linear(linear)
 
 
 def test_generate_image_builds_explicit_device_inputs(monkeypatch):
